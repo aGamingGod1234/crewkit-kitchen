@@ -5,7 +5,7 @@ import { PendingConversationInbox } from '../src/pending-conversation-inbox.mjs'
 import { burst } from './fixtures/runtime-inbox-scenarios.mjs';
 import { gate } from './fixtures/runtime-inbox-fixture.mjs';
 
-test('burst followup waits for the prior correction to commit', async () => {
+test('burst followup waits for the prior correction to commit', { timeout: 120_000 }, async () => {
   const held = gate();
   const entered = gate();
   const original = PendingConversationInbox.prototype.commit;

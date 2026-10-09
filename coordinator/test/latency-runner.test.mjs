@@ -78,7 +78,7 @@ function movementProvider() {
 	};
 }
 
-test('strictly normalizes matrix identity, budgets, loads, and unique trial IDs', () => {
+test('strictly normalizes matrix identity, budgets, loads, and unique trial IDs', { timeout: 120_000 }, () => {
 	const normalized = normalizeLatencyMatrix(matrix());
 	assert.deepEqual(normalized.agentLoads, [1, 4, 8, 16]);
 	assert.deepEqual(normalized.fixedSeeds, [42]);
@@ -93,7 +93,7 @@ test('strictly normalizes matrix identity, budgets, loads, and unique trial IDs'
 	}] })), /Codex provider/);
 });
 
-test('runs deterministic instant full-path trials at every declared load', async () => {
+test('runs deterministic instant full-path trials at every declared load', { timeout: 120_000 }, async () => {
 	// This checks coordinator behavior; shared CI runners need scheduling headroom.
 	const trials = matrix().trials.map((trial) => ({ ...trial, turnBudgetMs: 1_000, trialBudgetMs: 10_000 }));
 	const result = await runLatencyMatrix({
@@ -119,7 +119,7 @@ test('runs deterministic instant full-path trials at every declared load', async
 	assert.equal(result.cleanup.ok, true);
 });
 
-test('reports explicit injected wall-clock and virtual-clock measurements', async () => {
+test('reports explicit injected wall-clock and virtual-clock measurements', { timeout: 120_000 }, async () => {
 	let wall = 0;
 	const result = await runLatencyMatrix({
 		matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'measurement', scenarioId: 'fixture-movement', agentLoad: 1 }] }),
@@ -148,7 +148,7 @@ test('reports explicit injected wall-clock and virtual-clock measurements', asyn
 	assert.ok(metrics.raw.providerPlanningWait.length > 0);
 });
 
-test('aggregates acceptance and physical displacement across every agent at load four', async () => {
+test('aggregates acceptance and physical displacement across every agent at load four', { timeout: 120_000 }, async () => {
 	const result = await runLatencyMatrix({
 		matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'movement-load-four', scenarioId: 'fixture-movement', agentLoad: 4 }] }),
 		scenarioResolver: () => movementScenario(),
@@ -174,7 +174,7 @@ test('aggregates acceptance and physical displacement across every agent at load
 	assert.ok(['move_to', 'navigate_to'].includes(metrics.result.firstAuthoritativePhysicalDisplacement.actionType));
 });
 
-test('preserves bounded pairing context and reports per-trial process deltas', async () => {
+test('preserves bounded pairing context and reports per-trial process deltas', { timeout: 120_000 }, async () => {
 	const processSamples = [
 		{ cpuUserMs: 10, cpuSystemMs: 4, rssBytes: 100, heapUsedBytes: 50 },
 		{ cpuUserMs: 17, cpuSystemMs: 6, rssBytes: 130, heapUsedBytes: 70 },
@@ -209,7 +209,7 @@ test('preserves bounded pairing context and reports per-trial process deltas', a
 	assert.ok(Number.isFinite(trial.setupSpansMs.coordinatorStart));
 });
 
-test('records only declared hazard and direct-message event timing', async () => {
+test('records only declared hazard and direct-message event timing', { timeout: 120_000 }, async () => {
 	const base = matrix().trials[0];
 	const result = await runLatencyMatrix({
 		matrix: matrix({ trials: [
@@ -245,7 +245,7 @@ test('records only declared hazard and direct-message event timing', async () =>
 	assert.equal(respawn.trials[0].metrics.raw.physicalDisplacement.length, 0);
 });
 
-test('does not attribute a sender follow-up action as a direct-message recipient reaction', async () => {
+test('does not attribute a sender follow-up action as a direct-message recipient reaction', { timeout: 120_000 }, async () => {
 	const base = getSimulatorScenario('direct-message-wake');
 	const scenario = {
 		...base,
@@ -262,7 +262,7 @@ test('does not attribute a sender follow-up action as a direct-message recipient
 	assert.equal(reaction.reactionVirtualLatencyMs, null);
 });
 
-test('measurement instrumentation does not change comparable action commands', async () => {
+test('measurement instrumentation does not change comparable action commands', { timeout: 120_000 }, async () => {
 	const run = (measurements) => runLatencyMatrix({
 		matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'metrics-parity', scenarioId: 'fixture-movement', agentLoad: 1 }] }),
 		scenarioResolver: () => movementScenario(),
@@ -283,7 +283,7 @@ test('measurement instrumentation does not change comparable action commands', a
 	assert.equal(disabled.summary, 0);
 });
 
-test('command parity hashes actual ordered commands for every agent and rejects changed arguments', async () => {
+test('command parity hashes actual ordered commands for every agent and rejects changed arguments', { timeout: 120_000 }, async () => {
 	const digest = (commands) => `sha256:${createHash('sha256').update(JSON.stringify(commands)).digest('hex')}`;
 	const run = async (durationMs) => {
 		let virtual;
@@ -320,7 +320,7 @@ test('command parity hashes actual ordered commands for every agent and rejects 
 	assert.equal(comparison.checks.find((check) => check.code === 'INSTRUMENTATION_BEHAVIOR_PARITY').status, 'FAILED');
 });
 
-test('live-session parity ignores only session identity and still rejects changed arguments, agents, and order', async () => {
+test('live-session parity ignores only session identity and still rejects changed arguments, agents, and order', { timeout: 120_000 }, async () => {
 	const profile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
 	const run = async ({ measurements = true, waits = [1, 3], agentId = 'agent-a' } = {}) => {
 		let virtual;
@@ -352,7 +352,7 @@ test('live-session parity ignores only session identity and still rejects change
 	}
 });
 
-test('live trials use only the injected provider CLI health monitor; none is built by the runner', async () => {
+test('live trials use only the injected provider CLI health monitor; none is built by the runner', { timeout: 120_000 }, async () => {
 	const profile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
 	const checks = [];
 	const providerCliHealth = {
@@ -371,7 +371,7 @@ test('live trials use only the injected provider CLI health monitor; none is bui
 	assert.ok(checks.includes('codex'), 'the injected monitor probes the launched provider');
 });
 
-test('live-mode synthetic providers retain synthetic identity in results and events', async () => {
+test('live-mode synthetic providers retain synthetic identity in results and events', { timeout: 120_000 }, async () => {
 	const profile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
 	for (const synthetic of [true, false]) {
 		const result = await runLatencyMatrix({
@@ -389,7 +389,7 @@ test('live-mode synthetic providers retain synthetic identity in results and eve
 	}
 });
 
-test('synthetic live-provider failures and skips retain their provenance', async () => {
+test('synthetic live-provider failures and skips retain their provenance', { timeout: 120_000 }, async () => {
 	const profile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
 	for (const available of [true, false]) {
 		const result = await runLatencyMatrix({
@@ -403,7 +403,7 @@ test('synthetic live-provider failures and skips retain their provenance', async
 	}
 });
 
-test('polls conversation history only while a declared chat event is pending', async () => {
+test('polls conversation history only while a declared chat event is pending', { timeout: 120_000 }, async () => {
 	const original = VirtualWorld.prototype.conversationEvents;
 	let calls = 0;
 	VirtualWorld.prototype.conversationEvents = function measuredConversationEvents() { calls += 1; return original.call(this); };
@@ -426,7 +426,7 @@ test('polls conversation history only while a declared chat event is pending', a
 	}
 });
 
-test('marks synthetic identity and returns scoped benchmark and system summaries', async () => {
+test('marks synthetic identity and returns scoped benchmark and system summaries', { timeout: 120_000 }, async () => {
 	const recorder = new BenchmarkRecorder({ clock: () => 1 });
 	const result = await runLatencyMatrix({
 		matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'summary-trial' }] }),
@@ -459,13 +459,13 @@ test('shipped default matrix proves physical stone-tool success for every isolat
 	assert.ok(result.trials.every((trial) => trial.debug?.scenarioDigest?.startsWith('sha256:')));
 });
 
-test('publishes goal and factual verification phase events for deterministic harness reports', async () => {
+test('publishes goal and factual verification phase events for deterministic harness reports', { timeout: 120_000 }, async () => {
 	const result = await runLatencyMatrix({ matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'phase-events' }] }), scenarioResolver: () => fixtureScenario(), includeRawEvents: true, artifactDirectory: null });
 	const stages = new Set(result.rawEvents.map((event) => event.stage ?? event.phase));
 	for (const stage of ['goal_received', 'verification_started', 'verification_completed', 'goal_completed']) assert.equal(stages.has(stage), true, `missing ${stage}`);
 });
 
-test('delayed stone-tool pacing completes in one planner turn without reactive completion requests', async () => {
+test('delayed stone-tool pacing completes in one planner turn without reactive completion requests', { timeout: 120_000 }, async () => {
 	const profile = { provider: 'codex', model: 'stone-fixture', reasoningEffort: 'fixed', serviceTier: 'local' };
 	const scenario = getSimulatorScenario('stone-tool-gathering');
 	const decision = compileScenarioDecision(scenario);
@@ -505,7 +505,7 @@ test('delayed stone-tool pacing completes in one planner turn without reactive c
 	assert.equal(recorder.snapshot().filter((event) => event.stage === 'planner_requested').length, 1);
 });
 
-test('skips optional unavailable providers, fails required providers, and never substitutes', async () => {
+test('skips optional unavailable providers, fails required providers, and never substitutes', { timeout: 120_000 }, async () => {
 	const unavailable = () => ({ available: false, reason: 'fixture unavailable' });
 	const optional = await runLatencyMatrix({ matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'optional', mode: 'live', providerProfile: { provider: 'codex', model: 'fixture', reasoningEffort: 'high', serviceTier: 'fast' }, providerAvailabilityRequired: false }] }), scenarioResolver: () => fixtureScenario(), providerFactories: { codex: unavailable }, artifactDirectory: null });
 	assert.equal(optional.trials[0].status, 'SKIPPED');
@@ -513,7 +513,7 @@ test('skips optional unavailable providers, fails required providers, and never 
 	await assert.rejects(() => runLatencyMatrix({ matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'required', mode: 'live', providerProfile: { provider: 'codex', model: 'fixture', reasoningEffort: 'high', serviceTier: 'fast' }, providerAvailabilityRequired: true }] }), scenarioResolver: () => fixtureScenario(), providerFactories: { codex: unavailable }, artifactDirectory: null }), (error) => error.code === 'PROVIDER_UNAVAILABLE');
 });
 
-test('writes artifacts before throwing for a required unavailable provider', async () => {
+test('writes artifacts before throwing for a required unavailable provider', { timeout: 120_000 }, async () => {
 	const directory = await mkdtemp(path.join(os.tmpdir(), 'latency-required-artifacts-'));
 	try {
 		await assert.rejects(() => runLatencyMatrix({
@@ -530,7 +530,7 @@ test('writes artifacts before throwing for a required unavailable provider', asy
 	}
 });
 
-test('requires an exact declared identity for live providers', async () => {
+test('requires an exact declared identity for live providers', { timeout: 120_000 }, async () => {
 	const liveProfile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
 	const liveTrial = { ...matrix().trials[0], id: 'live-identity', mode: 'live', providerProfile: liveProfile, providerAvailabilityRequired: true };
 	const session = { async setGoalRevision() {}, async decide() { return fixtureDecision(); } };
@@ -550,7 +550,7 @@ test('requires an exact declared identity for live providers', async () => {
 	}
 });
 
-test('turn and trial timeouts produce typed bounded failures and clean provider lifecycle', async () => {
+test('turn and trial timeouts produce typed bounded failures and clean provider lifecycle', { timeout: 120_000 }, async () => {
 	let stopped = 0;
 	const hanging = () => ({
 		async start() {}, async stop() { stopped += 1; },
@@ -566,7 +566,7 @@ test('turn and trial timeouts produce typed bounded failures and clean provider 
 	assert.equal(result.cleanup.ok, true);
 });
 
-test('createAgent is bounded by the trial deadline and stops the provider', async () => {
+test('createAgent is bounded by the trial deadline and stops the provider', { timeout: 120_000 }, async () => {
 	let stopped = 0;
 	const result = await runLatencyMatrix({
 		matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'create-agent-timeout', trialBudgetMs: 2_000 }] }),
@@ -588,7 +588,7 @@ test('createAgent is bounded by the trial deadline and stops the provider', asyn
 	assert.equal(result.cleanup.ok, true);
 });
 
-test('provider stop after a timeout is bounded by cleanup policy', async () => {
+test('provider stop after a timeout is bounded by cleanup policy', { timeout: 120_000 }, async () => {
 	let stopFinished = false;
 	let releaseStop;
 	const stopGate = new Promise((resolve) => { releaseStop = resolve; });
@@ -617,7 +617,7 @@ test('provider stop after a timeout is bounded by cleanup policy', async () => {
 	}
 });
 
-test('malformed planner/runtime decisions remain typed failures instead of timeout results', async () => {
+test('malformed planner/runtime decisions remain typed failures instead of timeout results', { timeout: 120_000 }, async () => {
 	const result = await runLatencyMatrix({
 		matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'malformed-decision' }] }),
 		scenarioResolver: () => fixtureScenario(),
@@ -637,7 +637,7 @@ test('malformed planner/runtime decisions remain typed failures instead of timeo
 	assert.equal(result.trials[0].error.code, 'INVALID_DECISION');
 });
 
-test('provider process exit is typed and leaves the coordinator path clean', async () => {
+test('provider process exit is typed and leaves the coordinator path clean', { timeout: 120_000 }, async () => {
 	let stopped = 0;
 	const providerFactory = () => ({
 		available: true,
@@ -654,7 +654,7 @@ test('provider process exit is typed and leaves the coordinator path clean', asy
 	assert.equal(stopped, 1);
 });
 
-test('startup failure detaches virtual relays and stops a provider exactly once', async () => {
+test('startup failure detaches virtual relays and stops a provider exactly once', { timeout: 120_000 }, async () => {
 	let stopped = 0;
 	const result = await runLatencyMatrix({
 		matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'startup-failure' }] }),
@@ -671,7 +671,7 @@ test('startup failure detaches virtual relays and stops a provider exactly once'
 	assert.equal(stopped, 1);
 });
 
-test('artifact output is staged, bounded, and redacted on provider failure', async () => {
+test('artifact output is staged, bounded, and redacted on provider failure', { timeout: 120_000 }, async () => {
 	const directory = await mkdtemp(path.join(os.tmpdir(), 'latency-artifacts-'));
 	try {
 		const secret = 'fixture-secret-token-123456';
@@ -692,7 +692,7 @@ test('artifact output is staged, bounded, and redacted on provider failure', asy
 	}
 });
 
-test('artifact rollback preserves the only prior copy when restoration fails', async () => {
+test('artifact rollback preserves the only prior copy when restoration fails', { timeout: 120_000 }, async () => {
 	const root = await mkdtemp(path.join(os.tmpdir(), 'latency-rollback-'));
 	const directory = path.join(root, 'artifacts');
 	await mkdir(directory, { recursive: true });
@@ -719,7 +719,7 @@ test('artifact rollback preserves the only prior copy when restoration fails', a
 	}
 });
 
-test('replay mode uses the same full coordinator path and rejects prompt drift', async () => {
+test('replay mode uses the same full coordinator path and rejects prompt drift', { timeout: 120_000 }, async () => {
 	const profile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
 	const source = 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); program.finish("done");';
 	let prompt = null;
@@ -744,7 +744,7 @@ test('replay mode uses the same full coordinator path and rejects prompt drift',
 	assert.equal(drift.trials[0].error.code, 'REPLAY_IDENTITY_MISMATCH');
 });
 
-test('only synthetic benchmark sessions reuse fixture identity and preserve an explicit world ID', async () => {
+test('only synthetic benchmark sessions reuse fixture identity and preserve an explicit world ID', { timeout: 120_000 }, async () => {
 	const profile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
 	const scenario = fixtureScenario();
 	scenario.world.worldId = 'fixture-world-session-isolation';
@@ -771,7 +771,7 @@ test('only synthetic benchmark sessions reuse fixture identity and preserve an e
 	assert.deepEqual(liveA.provenance, liveB.provenance);
 });
 
-test('Codex benchmark sessions receive the explicit ArenaScript protocol', async () => {
+test('Codex benchmark sessions receive the explicit ArenaScript protocol', { timeout: 120_000 }, async () => {
 	const profile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
 	const optionsSeen = [];
 	const scenario = fixtureScenario();
@@ -801,7 +801,7 @@ test('Codex benchmark sessions receive the explicit ArenaScript protocol', async
 	assert.equal(optionsSeen[0].controlProtocol, 'arena_script');
 });
 
-test('paces delayed replay ticks against wall time instead of racing virtual time ahead', async () => {
+test('paces delayed replay ticks against wall time instead of racing virtual time ahead', { timeout: 120_000 }, async () => {
 	const profile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
 	const scenario = fixtureScenario();
 	const trial = { ...matrix().trials[0], id: 'paced-replay', mode: 'replay', providerProfile: profile, trialBudgetMs: 30_000, turnBudgetMs: 10_000 };

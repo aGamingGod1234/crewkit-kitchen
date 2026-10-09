@@ -5,7 +5,7 @@ import path from 'node:path';
 import { runPairedCli } from '../src/benchmark/paired-cli.mjs';
 import { fixture, launcher, json } from './fixtures/paired-cli-fixture.mjs';
 const quotePS = value => "'" + value.replaceAll("'", "''") + "'";
-test('job containment kills orphaned descendants and does not trust a false clean wrapper', { skip: process.platform !== 'win32' }, async t => {
+test('job containment kills orphaned descendants and does not trust a false clean wrapper', { skip: process.platform !== 'win32', timeout: 180_000 }, async t => {
 	const f = await fixture(t);
 	const rogue = path.join(f.directory, 'orphan.mjs'); await writeFile(rogue, 'setInterval(()=>{},1000);');
 	await writeFile(f.fakeLauncher, `param([string] $ProjectRoot,[switch] $FunctionsOnly)

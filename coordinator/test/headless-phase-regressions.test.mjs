@@ -145,7 +145,7 @@ async function matrixExpiry({ statusDelay = 1100, cleanupOptions = {}, cleanupBu
 	} finally { await rm(directory, { recursive: true, force: true }); }
 }
 
-test('paired matrix retires status request at trial expiry and authenticates cleanup before stop/remove', async () => {
+test('paired matrix retires status request at trial expiry and authenticates cleanup before stop/remove', { timeout: 120_000 }, async () => {
 	const { report, sockets } = await matrixExpiry();
 	assert.equal(report.classification, 'TIMEOUT'); assert.equal(report.cleanup.status, 'CLEAN');
 	assert.equal(report.postRunEvidence.status, 'STOPPED');
@@ -157,7 +157,7 @@ test('paired matrix retires status request at trial expiry and authenticates cle
 	assert.equal(sockets[1].writes[0].type, 3);
 });
 
-test('cleanup connection/authentication, stop and removal failures stay unclean and close both owned clients', async (t) => {
+test('cleanup connection/authentication, stop and removal failures stay unclean and close both owned clients', { timeout: 120_000 }, async (t) => {
 	for (const [label, options] of [
 		['connection hangs', { cleanupOptions: { connectionHangs: true }, cleanupBudget: 80 }],
 		['authentication hangs', { cleanupOptions: { auth: 'hang' }, cleanupBudget: 80 }],
@@ -176,7 +176,7 @@ test('cleanup connection/authentication, stop and removal failures stay unclean 
 	});
 });
 
-test('paired poll expiry and unpaired delayed status controls keep the original authenticated transport', async (t) => {
+test('paired poll expiry and unpaired delayed status controls keep the original authenticated transport', { timeout: 120_000 }, async (t) => {
 	for (const paired of [true, false]) await t.test(paired ? 'paired polling' : 'unpaired request', async () => {
 		const s = scenario(), state = world(), socket = new FramedSocket(state, { statusDelay: paired ? 0 : 1100 });
 		const client = clientFor(socket); await client.connect();
@@ -195,7 +195,7 @@ test('paired poll expiry and unpaired delayed status controls keep the original 
 	});
 });
 
-test('paired fractional clocks produce unchanged public names while retaining fractional elapsed time', async (t) => {
+test('paired fractional clocks produce unchanged public names while retaining fractional elapsed time', { timeout: 120_000 }, async (t) => {
 	assert.equal(canonical('ha_clock_02s.i'), 'ha_clock_02s_i', 'dotted-name negative control');
 	assert.equal(canonical('ha_clock_0002s'), 'ha_clock_0002s', 'integral-name control');
 	for (const clock of [100, 100.5, 72.25, 75.5, 76.875]) await t.test(String(clock), async () => {

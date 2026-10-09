@@ -79,7 +79,7 @@ for await (const line of createInterface({ input: process.stdin })) {
 }
 
 } else {
-test('actual paired CLI preserves full-budget timeouts and still contains blocked cleanup', async () => {
+test('actual paired CLI preserves full-budget timeouts and still contains blocked cleanup', { timeout: 180_000 }, async () => {
 const directory = process.env.G08_EVIDENCE_DIR ?? tmpdir();
 await mkdir(directory, { recursive: true });
 const root = fileURLToPath(new URL('../../', import.meta.url));
@@ -158,7 +158,7 @@ assert.equal(blocked.childEvidence[0]['blocked-cleanup'].entered, true);
 assert.equal(results.every(result => result.childEvidence.every(value => value.exited)), true);
 });
 
-test('deadline handoff spends cleanup reserve and requires final timeout evidence', async () => {
+test('deadline handoff spends cleanup reserve and requires final timeout evidence', { timeout: 180_000 }, async () => {
   for (const outcome of ['TIMED_OUT', 'PASSED', null, 'cleanup-overrun']) {
     let time = 0, trialDeadline, calls = 0;
     const profile = { provider: 'codex', model: 'offline', reasoningEffort: 'high', serviceTier: 'priority' };
@@ -192,7 +192,7 @@ test('deadline handoff spends cleanup reserve and requires final timeout evidenc
   }
 });
 
-test('a worker ignoring trial expiry is contained at the existing cleanup cutoff', async () => {
+test('a worker ignoring trial expiry is contained at the existing cleanup cutoff', { timeout: 180_000 }, async () => {
   const worker = phaseWorker(process.execPath, ['-e', 'setInterval(() => {}, 1000)']);
   const deadlineMs = performance.now() + 100;
   const cleanupDeadlineMs = deadlineMs + 200;
@@ -205,7 +205,7 @@ test('a worker ignoring trial expiry is contained at the existing cleanup cutoff
   assert.throws(() => process.kill(worker.pid, 0), { code: 'ESRCH' });
 });
 
-test('deadline handoff retains containment when its caller never begins cleanup', async () => {
+test('deadline handoff retains containment when its caller never begins cleanup', { timeout: 180_000 }, async () => {
   const worker = phaseWorker(process.execPath, ['-e', 'setInterval(() => {}, 1000)']);
   const deadlineMs = performance.now() + 100;
   try {

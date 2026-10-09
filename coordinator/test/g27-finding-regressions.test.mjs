@@ -34,7 +34,7 @@ function Reject($action, $message) {
   });
 }
 
-test('diagnostic A/B relative arm runners execute distinct modules; shared Node runner needs neutral intent', { skip: !windows }, () => fixture(root => {
+test('diagnostic A/B relative arm runners execute distinct modules; shared Node runner needs neutral intent', { skip: !windows, timeout: 180_000 }, () => fixture(root => {
   const relative = 'coordinator/src/benchmark/latency-runner-cli.mjs';
   for (const arm of ['baseline', 'optimized']) {
     const dir = path.join(root, arm);
@@ -77,7 +77,7 @@ Check ($neutral.status -eq 'passed') 'caller-relative common neutral runner reje
   assert.match(output, /PASS runner identity/);
 }));
 
-test('diagnostic arm consumer rejects incomplete repetitions or metrics before p95', { skip: !windows }, () => fixture(root => {
+test('diagnostic arm consumer rejects incomplete repetitions or metrics before p95', { skip: !windows, timeout: 180_000 }, () => fixture(root => {
   const output = powershell(root, String.raw`
 $context = [pscustomobject]@{ RunnerTrialId='g27';TrialId='g27';Arm='baseline';RunId='run';SourceHash='source';ConfigHash='config';PlanningConcurrency=16;Seed=1;Mode='instant';ExpectedRepetitions=5 }
 function Sample($count) {
@@ -122,7 +122,7 @@ foreach($count in @(5,4)) {
   assert.match(output, /PASS complete samples/);
 }));
 
-test('diagnostic cleanup retains orphan ownership and never kills replacement handles', { skip: !windows }, () => fixture(root => {
+test('diagnostic cleanup retains orphan ownership and never kills replacement handles', { skip: !windows, timeout: 180_000 }, () => fixture(root => {
   const output = powershell(root, String.raw`
 function Handle($id,$exited,$key) {
   $p=[pscustomobject]@{Id=$id;HasExited=$exited;Killed=$false;Disposed=$false;Handle=1;StartTime=[DateTime]'2026-01-01';Key=$key}

@@ -6,6 +6,7 @@ import test from 'node:test';
 
 test('packaging checks installed metadata, artifact parity and retained map attribution', {
 	skip: process.platform !== 'win32' && 'Windows packaging verifier',
+	timeout: 120_000,
 }, () => {
 	const project = fileURLToPath(new URL('../../', import.meta.url));
 	const result = spawnSync('powershell.exe', ['-NoProfile', '-File', 'scripts/test-coordinator-packaging.ps1'], {

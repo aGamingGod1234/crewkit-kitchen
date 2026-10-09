@@ -75,14 +75,14 @@ export class CodexService {
 `, 'utf8');
 }
 
-test('native A/B trial contains missing service-module failures at the CLI root', async () => {
+test('native A/B trial contains missing service-module failures at the CLI root', { timeout: 120_000 }, async () => {
 	const first = await runCli('native-tool-ab-trial.mjs', [privateMissingModule, 'baseline', '1']);
 	const second = await runCli('native-tool-ab-trial.mjs', [privateMissingModule, 'baseline', '1']);
 	assertBoundedSanitizedFailure(first, 'ERR_MODULE_NOT_FOUND');
 	assertBoundedSanitizedFailure(second, 'ERR_MODULE_NOT_FOUND');
 });
 
-test('native A/B trial accepts documented normalized move/mine forms and rejects unrelated work', async (context) => {
+test('native A/B trial accepts documented normalized move/mine forms and rejects unrelated work', { timeout: 120_000 }, async (context) => {
 	const root = await mkdtemp(path.join(os.tmpdir(), 'native-ab-normalization-'));
 	const fixture = path.join(coordinatorRoot, 'test/fixtures/native-benchmark-service.mjs');
 	try {
@@ -114,7 +114,7 @@ test('native A/B trial accepts documented normalized move/mine forms and rejects
 	}
 });
 
-test('native A/B runner contains child module failures at the CLI root', async () => {
+test('native A/B runner contains child module failures at the CLI root', { timeout: 120_000 }, async () => {
 	const root = await mkdtemp(path.join(os.tmpdir(), 'native-ab-cli-failure-'));
 	try {
 		const outputPath = path.join(root, 'private-result.json');
@@ -140,14 +140,14 @@ test('native A/B runner contains child module failures at the CLI root', async (
 	}
 });
 
-test('native load probe contains setup validation failures at the CLI root', async () => {
+test('native load probe contains setup validation failures at the CLI root', { timeout: 120_000 }, async () => {
 	const first = await runCli('native-tool-load-probe.mjs', [privateMissingModule, 'low', 'fast', '0']);
 	const second = await runCli('native-tool-load-probe.mjs', [privateMissingModule, 'low', 'fast', '0']);
 	assertBoundedSanitizedFailure(first, 'ERROR');
 	assertBoundedSanitizedFailure(second, 'ERROR');
 });
 
-test('native tool probe contains setup failures at the CLI root', async () => {
+test('native tool probe contains setup failures at the CLI root', { timeout: 120_000 }, async () => {
 	const root = await mkdtemp(path.join(os.tmpdir(), 'native-probe-cli-failure-'));
 	try {
 		const blockedTemp = path.join(root, 'api-token-secret.mjs');
@@ -161,7 +161,7 @@ test('native tool probe contains setup failures at the CLI root', async () => {
 	}
 });
 
-test('native A/B runner success reports only the artifact basename', async () => {
+test('native A/B runner success reports only the artifact basename', { timeout: 120_000 }, async () => {
 	const root = await mkdtemp(path.join(os.tmpdir(), 'native-ab-cli-success-'));
 	try {
 		const fixture = path.join(root, 'fixture-service.mjs');
@@ -182,7 +182,7 @@ test('native A/B runner success reports only the artifact basename', async () =>
 	}
 });
 
-test('native trial sanitizes credential-shaped success fields through the common boundary', async () => {
+test('native trial sanitizes credential-shaped success fields through the common boundary', { timeout: 120_000 }, async () => {
 	const root = await mkdtemp(path.join(os.tmpdir(), 'native-cli-sanitized-success-'));
 	try {
 		const fixture = path.join(root, 'fixture-service.mjs');
@@ -208,7 +208,7 @@ test('native trial sanitizes credential-shaped success fields through the common
 	}
 });
 
-test('native terminal serializer bounds escaped JSON to 8 KiB and keeps it valid', async () => {
+test('native terminal serializer bounds escaped JSON to 8 KiB and keeps it valid', { timeout: 120_000 }, async () => {
 	const root = await mkdtemp(path.join(os.tmpdir(), 'native-cli-bounded-success-'));
 	try {
 		const fixture = path.join(root, 'fixture-service.mjs');
@@ -226,7 +226,7 @@ test('native terminal serializer bounds escaped JSON to 8 KiB and keeps it valid
 	}
 });
 
-test('cleanup failure replaces success with exactly one failed terminal outcome', async () => {
+test('cleanup failure replaces success with exactly one failed terminal outcome', { timeout: 120_000 }, async () => {
 	const root = await mkdtemp(path.join(os.tmpdir(), 'native-cli-cleanup-failure-'));
 	try {
 		const fixture = path.join(root, 'fixture-service.mjs');
@@ -245,7 +245,7 @@ test('cleanup failure replaces success with exactly one failed terminal outcome'
 	}
 });
 
-test('hostile terminal status access cannot create a second outcome', async (context) => {
+test('hostile terminal status access cannot create a second outcome', { timeout: 120_000 }, async (context) => {
 	for (const [name, fixture] of [
 		['accessor', () => {
 			let calls = 0;

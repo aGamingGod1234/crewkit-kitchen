@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { runBenchmark } from '../src/benchmark/cave-navigation-attention.mjs';
 
-test('cave attention benchmark compares actual public native interfaces with identical authored controls', async () => {
+test('cave attention benchmark compares actual public native interfaces with identical authored controls', { timeout: 120_000 }, async () => {
   const result = await runBenchmark({ settings: { repetitions: 1, warmups: 0, actionMs: 5, decisionMs: 15, observationMs: 1 } });
   assert.equal(result.providerUsed, false);
   assert.equal(result.minecraftServerUsed, false);

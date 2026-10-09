@@ -5,7 +5,7 @@ import path from 'node:path';
 import { runPairedCli } from '../src/benchmark/paired-cli.mjs';
 import { fixture, json } from './fixtures/paired-cli-fixture.mjs';
 
-test('paired cleanup drains runner output after stopping sibling pipe writers', { skip: process.platform !== 'win32' }, async t => {
+test('paired cleanup drains runner output after stopping sibling pipe writers', { skip: process.platform !== 'win32', timeout: 180_000 }, async t => {
 	const f = await fixture(t);
 	// Framework anonymous-pipe reads occupy pool threads. A small pool makes
 	// idle server/coordinator reads deterministically delay the runner drains.
