@@ -74,6 +74,26 @@ public final class LobbyMusicFeature implements CrewkitFeature {
 		composeOutro();
 	}
 
+	// ---- read-only beat clock for dancers (GuestDanceFeature) ----
+
+	/** True while the loop or the outro is sequencing. */
+	public static boolean isPlaying() { return mode != Mode.OFF; }
+
+	/** True during the completed outro. */
+	public static boolean isOutro() { return mode == Mode.OUTRO; }
+
+	/** Position within the current beat, 0 on the beat rising to just under 1. */
+	public static double beatPhase() {
+		int beat = mode == Mode.OUTRO ? OUT_BEAT : BEAT;
+		return Math.floorMod(step - 1, beat) / (double) beat;
+	}
+
+	/** Whole beats elapsed in the current track, for patterns longer than one beat. */
+	public static int beatCount() {
+		int beat = mode == Mode.OUTRO ? OUT_BEAT : BEAT;
+		return Math.max(0, step - 1) / beat;
+	}
+
 	@Override
 	public void onEvent(MinecraftServer server, String event, JsonObject data, long seq) {
 		switch (event) {
