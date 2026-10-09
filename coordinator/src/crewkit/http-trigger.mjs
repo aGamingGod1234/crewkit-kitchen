@@ -34,6 +34,8 @@ export function createCrewkitController({ sink = () => {}, log = () => {} } = {}
       return run;
     },
     reset() {
+      // A reset under a fresh runId retires the active run in the mod, so its remaining events would be dropped.
+      if (active) { const e = new Error(`CrewKit run ${active.runId} is still in progress`); e.status = 409; throw e; }
       const payload = { runId: `ck-reset-${randomUUID().slice(0, 8)}`, seq: 1, event: 'reset', data: {} };
       sink(payload);
       return payload;
