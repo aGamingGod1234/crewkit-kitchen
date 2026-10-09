@@ -119,9 +119,28 @@ test('product names map to allowlisted vanilla items', () => {
   assert.equal(mapToMcItem({ productName: 'Open Day Thing', needLabel: 'unknown' }), 'minecraft:paper', 'no "pen" match inside "Open"; falls back to paper');
 });
 
-const EXPECTED = ['reset', 'brief', 'item_added', 'item_added', 'item_added', 'item_added', 'item_added', 'item_added',
+const EXPECTED = ['reset', 'brief', ...Array(6).fill(['candidates', 'item_added']).flat(),
   'quote', 'gate_blocked', 'item_removed', 'item_added', 'item_removed', 'item_added', 'quote', 'requirements', 'gate_passed',
   'checkout', 'checkout', 'completed', 'record'];
+
+test('candidates: each need fans up to 5 same-merchant search results right before its item_added', async () => {
+  const brief6 = JSON.parse(readFileSync(path.join(fixtures, 'demo-brief-6.json'), 'utf8'));
+  const { done } = await startRun(brief6, { mode: 'replay', speed: 0, writeRecords: false });
+  const r = await done;
+  const ev = r.events.filter((e) => e.event !== 'calls');
+  const fans = ev.filter((e) => e.event === 'candidates');
+  assert.equal(fans.length, brief6.needs.length + (brief6.extras || []).length);
+  for (const f of fans) {
+    const next = ev[ev.indexOf(f) + 1];
+    assert.equal(next.event, 'item_added');
+    const { query, options, chosenIndex } = f.data;
+    assert.ok(typeof query === 'string' && query.length);
+    assert.ok(options.length >= 1 && options.length <= 5);
+    assert.equal(options[chosenIndex].realName, next.data.realName);
+    for (const o of options) assert.ok(o.realName && o.mcItem.startsWith('minecraft:') && o.price.amount > 0 && o.price.currency === 'SGD');
+  }
+  assert.ok(fans.some((f) => f.data.options.length > 1), 'real tape gives a real choice');
+});
 
 test('replay emits the full contract sequence with one runId and gap-free seq', async () => {
   const sent = [];

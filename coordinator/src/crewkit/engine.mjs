@@ -59,6 +59,19 @@ function pickable(products, currency, lockedMerchant) {
   }));
 }
 
+// Decision visual: up to 5 real search results from the chosen product's merchant, chosen one included.
+export function candidatesFor(query, searched, chosen, needLabel, max = 5) {
+  const same = searched.filter((o) => o.merchant === chosen.merchant && o.productId !== chosen.productId);
+  const at = Math.max(0, Math.min(searched.filter((o) => o.merchant === chosen.merchant).findIndex((o) => o.productId === chosen.productId), max - 1));
+  const picks = same.slice(0, max - 1);
+  picks.splice(Math.min(at, picks.length), 0, chosen);
+  return {
+    query,
+    options: picks.map((o) => ({ realName: o.realName, mcItem: mapToMcItem({ productId: o.productId, productName: o.realName, needLabel }), price: o.unitPrice })),
+    chosenIndex: picks.indexOf(chosen),
+  };
+}
+
 export class RunFailed extends Error {
   constructor(status, reason) { super(`${status}: ${reason}`); this.status = status; this.reason = reason; }
 }
@@ -116,11 +129,14 @@ export async function runCrewkit({ brief: rawBrief, api, emit, enrollmentId, pol
   };
   for (const need of brief.needs) {
     let options = [];
+    let usedQuery = need.queries[0];
     for (const query of need.queries) {
       const res = await call('search', query, { merchant: brief.merchant || undefined, mode: 'ONLY', limit: 10, country: brief.country, currency: cur });
       options = pickable(res?.products, cur, lockedMerchant);
+      usedQuery = query;
       if (options.length) break;
     }
+    const searched = options.slice();
     let first = null;
     while (options.length && !first) first = await resolveVariant(options.shift());
     if (first) lockedMerchant ??= first.merchant;
@@ -131,6 +147,7 @@ export async function runCrewkit({ brief: rawBrief, api, emit, enrollmentId, pol
       if (need.optional) { log(`no product for optional extra ${need.id}, skipped`); continue; }
       return fail('failed', 'BRIEF_INFEASIBLE', `No available ${cur} product for "${need.label}" at ${brief.merchant || 'any merchant'}`);
     }
+    emit('candidates', candidatesFor(usedQuery, searched, first, need.label));
     addLine(need, first, required(need), need.substitutes ? options : []);
   }
 
