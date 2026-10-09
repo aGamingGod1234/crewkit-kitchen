@@ -25,13 +25,36 @@ public final class NavigationMotionVerification {
 		verifyLookController();
 		verifySteering();
 		verifyClearWalkLineScratchEquivalence();
+		verifyForwardInputAndCornering();
 		verifyOccupiedNode();
+		verifyFallingSteering();
+		verifyPassedWaypoint();
 		verifyJumps();
 		verifyGaze();
 		verifyHeadingHold();
 		verifyStairOvershootDoesNotSpin();
 		verifyStaircaseGaze();
 		return assertions;
+	}
+
+	private static void verifyForwardInputAndCornering() {
+		AgentInputStates.MotorState initial = AgentInputStates.MotorState.initial(0.0F, 0.0F);
+		AgentInputStates.MotorStep straight = AgentInputStates.stepMotor(initial,
+				new AgentInputStates.MotorTarget(0.0F, 10.0F, true, false, true), 0L);
+		assertEquals(1.0F, straight.forward(), "forward input is full strength on the first movement tick");
+		assertTrue(Math.abs(straight.strafe()) < 1.0E-6F, "straight movement does not invent lateral input");
+
+		AgentInputStates.MotorStep corner = AgentInputStates.stepMotor(initial,
+				new AgentInputStates.MotorTarget(90.0F, 10.0F, true, false, true), 0L);
+		assertEquals(45.0F, corner.yaw(), "a corner keeps the existing eased turn cap");
+		assertTrue(Math.abs(corner.forward() - (float) Math.cos(Math.toRadians(45.0D))) < 1.0E-4F,
+				"cornering uses the full forward component for its current heading");
+		assertEquals(-0.2F, corner.strafe(), "cornering retains the 0.2 strafe smoothing step");
+		AgentInputStates.MotorStep settled = AgentInputStates.stepMotor(corner.state(),
+				new AgentInputStates.MotorTarget(90.0F, 10.0F, true, false, true), 50L);
+		assertTrue(settled.forward() > corner.forward(), "forward strength follows the eased corner turn immediately");
+		assertTrue(Math.abs(settled.strafe()) > Math.abs(corner.strafe()),
+				"strafe smoothing continues to ease into the corner");
 	}
 
 	private static void verifyHeadingHold() {
@@ -269,6 +292,151 @@ public final class NavigationMotionVerification {
 		withStep.set(2, new PathNode(withStep.get(2).position(), TraversalType.JUMP_UP));
 		assertEquals(-1, ServerNavigationController.occupiedWalkNode(withStep, 1, stairs.get(3).position()),
 				"a jump node is never skipped");
+		// A drop, gap jump or step-up landing is skipped once the body stands in a later walk cell: an overshoot
+		// must not walk back onto the landing cell first.
+		for (TraversalType landing : List.of(TraversalType.DROP_DOWN, TraversalType.JUMP_GAP, TraversalType.JUMP_UP)) {
+			List<PathNode> route = new ArrayList<>();
+			route.add(new PathNode(new GridPosition(0, LEVEL + 1, 0), TraversalType.WALK));
+			route.add(new PathNode(new GridPosition(1, LEVEL, 0), landing));
+			for (int x = 2; x <= 6; x++) route.add(new PathNode(new GridPosition(x, LEVEL, 0), TraversalType.WALK));
+			assertEquals(2, ServerNavigationController.occupiedWalkNode(route, 1, route.get(2).position()),
+					landing + " landing is passed when the body overshoots into the next walk cell");
+			assertEquals(1, ServerNavigationController.occupiedWalkNode(route, 1, route.get(1).position()),
+					landing + " landing is passed when the body stands on it");
+			assertEquals(-1, ServerNavigationController.occupiedWalkNode(route, 1, route.get(0).position()),
+					landing + " landing stays active while the body is still on the upper level");
+			assertEquals(landing == TraversalType.DROP_DOWN ? 2 : -1,
+					ServerNavigationController.occupiedWalkNode(route, 0, route.get(2).position()),
+					"only a drop node further down the window is flown over; a jump node is never skipped");
+		}
+		// A sprinting body can clear the first step of a staircase down and land on the second: both drop nodes are behind it.
+		List<PathNode> stepsDown = new ArrayList<>();
+		stepsDown.add(new PathNode(new GridPosition(0, LEVEL + 3, 0), TraversalType.WALK));
+		stepsDown.add(new PathNode(new GridPosition(1, LEVEL + 2, 0), TraversalType.DROP_DOWN));
+		stepsDown.add(new PathNode(new GridPosition(2, LEVEL + 1, 0), TraversalType.DROP_DOWN));
+		stepsDown.add(new PathNode(new GridPosition(3, LEVEL, 0), TraversalType.DROP_DOWN));
+		stepsDown.add(new PathNode(new GridPosition(4, LEVEL, 0), TraversalType.WALK));
+		stepsDown.add(new PathNode(new GridPosition(5, LEVEL, 0), TraversalType.WALK));
+		assertEquals(2, ServerNavigationController.occupiedWalkNode(stepsDown, 1, stepsDown.get(2).position()),
+				"flying over a step lands on a later drop node, which passes the skipped one");
+		assertEquals(3, ServerNavigationController.occupiedWalkNode(stepsDown, 1, stepsDown.get(3).position()),
+				"clearing two steps passes both");
+		assertEquals(-1, ServerNavigationController.occupiedWalkNode(stepsDown, 1, stepsDown.get(0).position()),
+				"standing on the upper level passes nothing");
+		List<PathNode> dropThenTurn = new ArrayList<>();
+		dropThenTurn.add(new PathNode(new GridPosition(0, LEVEL + 1, 0), TraversalType.WALK));
+		dropThenTurn.add(new PathNode(new GridPosition(1, LEVEL, 0), TraversalType.DROP_DOWN));
+		dropThenTurn.add(new PathNode(new GridPosition(1, LEVEL, 1), TraversalType.JUMP_UP));
+		dropThenTurn.add(new PathNode(new GridPosition(1, LEVEL + 1, 2), TraversalType.WALK));
+		assertEquals(-1, ServerNavigationController.occupiedWalkNode(dropThenTurn, 1, new GridPosition(1, LEVEL + 1, 2)),
+				"a jump after the landing is never skipped");
+		assertEquals(1, ServerNavigationController.occupiedWalkNode(dropThenTurn, 1, dropThenTurn.get(1).position()),
+				"standing on the landing still passes it");
+		assertEquals(-1, ServerNavigationController.occupiedWalkNode(
+				List.of(new PathNode(new GridPosition(0, LEVEL, 0), TraversalType.WALK),
+						new PathNode(new GridPosition(1, LEVEL, 0), TraversalType.CLIMB),
+						new PathNode(new GridPosition(2, LEVEL, 0), TraversalType.WALK),
+						new PathNode(new GridPosition(3, LEVEL, 0), TraversalType.WALK)),
+				1, new GridPosition(2, LEVEL, 0)), "a climb is never skipped");
+	}
+
+	private static void verifyPassedWaypoint() {
+		List<PathNode> route = new ArrayList<>();
+		route.add(new PathNode(new GridPosition(0, LEVEL + 2, 0), TraversalType.WALK));
+		route.add(new PathNode(new GridPosition(1, LEVEL + 1, 0), TraversalType.DROP_DOWN));
+		route.add(new PathNode(new GridPosition(2, LEVEL, 0), TraversalType.DROP_DOWN));
+		route.add(new PathNode(new GridPosition(3, LEVEL, 0), TraversalType.WALK));
+		WalkabilityView ground = supportedRoute(route);
+		double level = LEVEL + 1;
+		assertTrue(ServerNavigationController.passedWaypoint(ground, new Vec3(2.26D, level, 0.5D), route, 1, level),
+				"a body hanging over the far edge of a drop landing has passed it");
+		assertTrue(!ServerNavigationController.passedWaypoint(ground, new Vec3(1.2D, level, 0.5D), route, 1, level),
+				"a body still short of the landing center has not");
+		assertTrue(!ServerNavigationController.passedWaypoint(ground, new Vec3(1.5D, level, 0.5D), route, 1, level),
+				"standing exactly on the center is left to the normal arrival check");
+		assertTrue(!ServerNavigationController.passedWaypoint(ground, new Vec3(2.6D, level, 0.5D), route, 1, level),
+				"more than a block past the center is a different problem than stepping back");
+		assertTrue(!ServerNavigationController.passedWaypoint(ground, new Vec3(2.26D, level + 1.0D, 0.5D), route, 1, level),
+				"a body on another level has not passed it");
+		assertTrue(!ServerNavigationController.passedWaypoint(ground, new Vec3(2.26D, level, 0.5D), route, 3, level),
+				"the endpoint always keeps its exact arrival check");
+		List<PathNode> jumpNext = new ArrayList<>(route);
+		jumpNext.set(2, new PathNode(new GridPosition(2, LEVEL + 2, 0), TraversalType.JUMP_UP));
+		assertTrue(!ServerNavigationController.passedWaypoint(supportedRoute(jumpNext), new Vec3(2.26D, level, 0.5D), jumpNext, 1, level),
+				"a jump leg after the waypoint still needs the body to line up");
+		List<PathNode> turn = new ArrayList<>(route);
+		turn.set(2, new PathNode(new GridPosition(1, LEVEL + 1, 1), TraversalType.WALK));
+		WalkabilityView turned = supportedRoute(turn);
+		assertTrue(!ServerNavigationController.passedWaypoint(turned, new Vec3(2.26D, level, 0.5D), turn, 1, level),
+				"past the center along the old heading is not past a corner that turns the other way");
+		assertTrue(ServerNavigationController.passedWaypoint(turned, new Vec3(1.5D, level, 1.2D), turn, 1, level),
+				"past the center toward the new heading is");
+		assertTrue(!ServerNavigationController.passedWaypoint(supportedRoute(route.subList(0, 2)), new Vec3(2.26D, level, 0.5D), route, 1, level),
+				"a body over the far edge with nothing to stand on toward the next node has not passed it");
+
+		// One-block-wide bridge: a body shoved sideways to the rim, still standing, is not waved on across the gap.
+		List<PathNode> bridge = new ArrayList<>();
+		for (int x = 0; x <= 5; x++) bridge.add(new PathNode(new GridPosition(x, LEVEL, 0), TraversalType.WALK));
+		WalkabilityView bridgeWorld = supportedRoute(bridge);
+		assertTrue(ServerNavigationController.passedWaypoint(bridgeWorld, new Vec3(1.7D, LEVEL, 0.5D), bridge, 1, LEVEL),
+				"a centred body past a bridge node moves on to the next one");
+		assertTrue(!ServerNavigationController.passedWaypoint(bridgeWorld, new Vec3(1.7D, LEVEL, 0.88D), bridge, 1, LEVEL),
+				"a body pushed to the south rim of a bridge has not passed the node");
+		assertTrue(!ServerNavigationController.passedWaypoint(bridgeWorld, new Vec3(1.7D, LEVEL, 0.12D), bridge, 1, LEVEL),
+				"a body pushed to the north rim of a bridge has not passed the node");
+
+		// Ledge corner: the path turns from east to south at (2,0); a body on the outside of the turn is over the void.
+		List<PathNode> ledge = new ArrayList<>();
+		ledge.add(new PathNode(new GridPosition(1, LEVEL, 0), TraversalType.WALK));
+		ledge.add(new PathNode(new GridPosition(2, LEVEL, 0), TraversalType.WALK));
+		ledge.add(new PathNode(new GridPosition(2, LEVEL, 1), TraversalType.WALK));
+		ledge.add(new PathNode(new GridPosition(2, LEVEL, 2), TraversalType.WALK));
+		WalkabilityView ledgeWorld = supportedRoute(ledge);
+		assertTrue(ServerNavigationController.passedWaypoint(ledgeWorld, new Vec3(2.5D, LEVEL, 0.8D), ledge, 1, LEVEL),
+				"a body past the corner node toward the new heading, on the ledge, has passed it");
+		assertTrue(!ServerNavigationController.passedWaypoint(ledgeWorld, new Vec3(2.92D, LEVEL, 0.7D), ledge, 1, LEVEL),
+				"a body on the outer rim of a ledge corner has not passed it");
+		assertTrue(!ServerNavigationController.passedWaypoint(ledgeWorld, new Vec3(2.5D, LEVEL, 0.1D), ledge, 1, LEVEL),
+				"a body that has not yet reached the turn has not passed it");
+
+		// Stairs down a one-block-wide cave passage with walls on both sides.
+		List<PathNode> stairs = new ArrayList<>();
+		stairs.add(new PathNode(new GridPosition(0, LEVEL + 2, 0), TraversalType.WALK));
+		stairs.add(new PathNode(new GridPosition(1, LEVEL + 1, 0), TraversalType.DROP_DOWN));
+		stairs.add(new PathNode(new GridPosition(2, LEVEL, 0), TraversalType.DROP_DOWN));
+		stairs.add(new PathNode(new GridPosition(3, LEVEL - 1, 0), TraversalType.DROP_DOWN));
+		stairs.add(new PathNode(new GridPosition(4, LEVEL - 1, 0), TraversalType.WALK));
+		Set<GridPosition> cave = supportBlocks(stairs);
+		for (int x = -1; x <= 5; x++) {
+			for (int y = LEVEL - 2; y <= LEVEL + 5; y++) {
+				cave.add(new GridPosition(x, y, -1));
+				cave.add(new GridPosition(x, y, 1));
+			}
+		}
+		WalkabilityView caveWorld = solidWorld(cave);
+		double step = LEVEL + 1;
+		assertTrue(ServerNavigationController.passedWaypoint(caveWorld, new Vec3(2.2D, step, 0.5D), stairs, 1, step),
+				"a body that clears a stair in a passage has passed it");
+		assertTrue(!ServerNavigationController.passedWaypoint(caveWorld, new Vec3(2.2D, step, 0.22D), stairs, 1, step),
+				"a body pressed against the passage wall is not waved on");
+		assertTrue(!ServerNavigationController.passedWaypoint(caveWorld, new Vec3(1.2D, step, 0.5D), stairs, 1, step),
+				"a body still on the stair has not passed it");
+	}
+
+	private static void verifyFallingSteering() {
+		List<PathNode> route = new ArrayList<>();
+		route.add(new PathNode(new GridPosition(0, LEVEL + 1, 0), TraversalType.WALK));
+		route.add(new PathNode(new GridPosition(1, LEVEL, 0), TraversalType.DROP_DOWN));
+		route.add(new PathNode(new GridPosition(2, LEVEL, 0), TraversalType.WALK));
+		assertEquals(2, ServerNavigationController.fallingSteerIndex(route, 1, false),
+				"a body falling to a drop landing keeps walking toward the next node");
+		assertEquals(1, ServerNavigationController.fallingSteerIndex(route, 1, true),
+				"a grounded body steers at its waypoint as before");
+		assertEquals(0, ServerNavigationController.fallingSteerIndex(route, 0, false),
+				"only drop landings are looked past");
+		route.remove(2);
+		assertEquals(1, ServerNavigationController.fallingSteerIndex(route, 1, false),
+				"a landing that is the endpoint keeps its exact arrival steering");
 	}
 
 	private static void verifyClearWalkLineScratchEquivalence() {
@@ -374,6 +542,22 @@ public final class NavigationMotionVerification {
 			}
 			return WalkabilityView.Cell.CLEAR;
 		};
+	}
+
+	/** Every node's feet cell stands on a full block below it. */
+	private static Set<GridPosition> supportBlocks(List<PathNode> nodes) {
+		Set<GridPosition> blocks = new HashSet<>();
+		for (PathNode node : nodes) blocks.add(node.position().below());
+		return blocks;
+	}
+
+	private static WalkabilityView supportedRoute(List<PathNode> nodes) {
+		return solidWorld(supportBlocks(nodes));
+	}
+
+	/** Air everywhere except the listed blocks, which are solid and support a body standing on top. */
+	private static WalkabilityView solidWorld(Set<GridPosition> solid) {
+		return position -> solid.contains(position) ? WalkabilityView.Cell.SAFE_SUPPORT : WalkabilityView.Cell.CLEAR;
 	}
 
 	private static void assertEquals(Object expected, Object actual, String message) {

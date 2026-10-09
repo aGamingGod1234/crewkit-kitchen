@@ -54,6 +54,8 @@ export function validateAction(value) {
 
 	switch (type) {
 		case 'move_to':
+			// One default for the native act path and ArenaScript: sprint is on unless the caller says otherwise.
+			if (action.sprint === undefined) action.sprint = true;
 			requireCoordinates(action, false, 'action');
 			requireFiniteRange(action.tolerance, 'action.tolerance', MIN_MOVEMENT_TOLERANCE, MAX_MOVEMENT_TOLERANCE);
 			requireBoolean(action.sprint, 'action.sprint');

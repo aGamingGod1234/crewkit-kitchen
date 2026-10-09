@@ -19,7 +19,8 @@ test('actual scenario dispatch rejects delayed trial and cleanup cutoffs without
     let trial,report,deadlineMs,cleanupDeadlineMs,exited=false;
     try{
       await worker.phase('startup',{now:()=>performance.now(),deadlineMs:performance.now()+5000});
-      deadlineMs=performance.now()+300;cleanupDeadlineMs=deadlineMs+2000;
+      // The control only proves a start before the cutoff, so give slow CI runners room; the delayed run keeps 300 ms against its 450 ms delay.
+      deadlineMs=performance.now()+(mode==='no-delay-control'?3000:300);cleanupDeadlineMs=deadlineMs+2000;
       await writeFile(path.join(directory,'parent-deadline.json'),JSON.stringify({deadlineMs,deadlineEpochMs:performance.timeOrigin+deadlineMs,cleanupDeadlineMs}));
       trial=await worker.phase('trial',{now:()=>performance.now(),deadlineMs,cleanupDeadlineMs});
       report=await worker.phase('cleanup',{now:()=>performance.now(),deadlineMs:cleanupDeadlineMs});

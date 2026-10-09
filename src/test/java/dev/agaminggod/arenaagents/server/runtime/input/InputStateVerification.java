@@ -620,7 +620,7 @@ public final class InputStateVerification {
 				new AgentInputStates.MotorTarget(0.0F, 0.0F, true, false, true),
 				0L
 		);
-		assertEquals(AgentInputStates.MOVE_ACCELERATION, first.forward(), "motor accelerates by a bounded amount");
+		assertEquals(1.0F, first.forward(), "forward input is applied immediately");
 		AgentInputStates.MotorStep braking = AgentInputStates.stepMotor(
 				first.state(),
 				new AgentInputStates.MotorTarget(0.0F, 0.0F, false, false, false),

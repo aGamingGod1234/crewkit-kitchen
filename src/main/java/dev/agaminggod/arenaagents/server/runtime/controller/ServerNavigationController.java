@@ -21,6 +21,8 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.AABB;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.ArrayList;
@@ -31,6 +33,8 @@ import java.util.function.BooleanSupplier;
 import java.util.function.ToDoubleFunction;
 
 public final class ServerNavigationController implements ServerController {
+	private static final Logger LOGGER = LoggerFactory.getLogger(ServerNavigationController.class);
+	private static final boolean TICK_DIAGNOSTICS_ENABLED = Boolean.getBoolean("arenaagents.navigation.debugTicks");
 	public static final int DEFAULT_MAX_PATH_LENGTH = 256;
 	public static final double MAX_LOCAL_PLANNING_DISTANCE = 32.0D;
 	private static final int MIN_AIR_RESERVE = SwimPlanning.AIR_RESERVE_TICKS;
@@ -61,6 +65,7 @@ public final class ServerNavigationController implements ServerController {
 	static final double GAP_TAKEOFF_MIN_DISTANCE = 1.0D;
 	/** Inside this horizontal distance the view holds its heading on the final approach and after an overshoot. */
 	static final double HOLD_HEADING_DISTANCE = 1.0D;
+	private static final double PASSED_LEVEL_TOLERANCE = 0.1D;
 	/** A steer point further round than this has been passed; the path never asks for such a turn this close. */
 	static final float BEHIND_DEGREES = 100.0F;
 	static final int GAZE_LOOKAHEAD_NODES = 3;
@@ -74,6 +79,8 @@ public final class ServerNavigationController implements ServerController {
 	private final long timeoutMs;
 	private final ElapsedTimeAccumulator elapsedTime;
 	private final ServerPathPlanner planner = new ServerPathPlanner();
+	private final BlockedMoveDetector blockedMoveDetector = new BlockedMoveDetector();
+	private MinecraftNavigationWorld navigationWorld;
 	private LocalPathfinder.Search search;
 	private Preparation preparation;
 	private MinecraftNavigationWorld searchWorld;
@@ -94,6 +101,9 @@ public final class ServerNavigationController implements ServerController {
 	private LeasedServerInputController inputController;
 	private AgentInputStates.MotorState motorState;
 	private boolean lastSprint;
+	private boolean blockedMoveTracking;
+	private boolean blockedMoveJumpPending;
+	private boolean blockedMoveStepUp;
 	private ResourceKey<Level> startingDimension;
 	/** Elapsed ms when the current rise to the water surface began, or -1 while not surfacing. */
 	private long surfacingSinceMs = -1L;
@@ -101,6 +111,8 @@ public final class ServerNavigationController implements ServerController {
 	private double surfacingCheckDistance;
 	/** Set when the route ahead needs more breath than is left, or no route starts under water: rise for air first. */
 	private boolean mustSurface;
+	private Vec3 diagnosticPreviousPosition;
+	private Vec3 diagnosticTarget;
 
 	public ServerNavigationController(
 			Vec3 destination,
@@ -130,6 +142,17 @@ public final class ServerNavigationController implements ServerController {
 	@Override
 	public TickResult tick(ServerPlayer player, long nowEpochMs) {
 		Objects.requireNonNull(player, "player must not be null");
+		if (!TICK_DIAGNOSTICS_ENABLED) return tickInternal(player, nowEpochMs);
+		long startedNanos = System.nanoTime();
+		try {
+			return tickInternal(player, nowEpochMs);
+		} finally {
+			logTickDiagnostics(player, System.nanoTime() - startedNanos);
+		}
+	}
+
+	private TickResult tickInternal(ServerPlayer player, long nowEpochMs) {
+		Objects.requireNonNull(player, "player must not be null");
 		ResourceKey<Level> currentDimension = player.level().dimension();
 		if (startingDimension == null) {
 			startingDimension = currentDimension;
@@ -154,7 +177,7 @@ public final class ServerNavigationController implements ServerController {
 		boolean eyesUnderWater = SwimPlanning.needsSurfacing(player.isInWater(), player.isUnderWater());
 		if (!eyesUnderWater) mustSurface = false;
 		if (eyesUnderWater && plan != null && !SwimPlanning.breathCovers(player.getAirSupply(),
-				submergedNodesAhead(new MinecraftNavigationWorld(player.level()), plan.nodes(), waypointIndex))) {
+				submergedNodesAhead(navigationWorld(player.level()), plan.nodes(), waypointIndex))) {
 			discardPlanning();
 			mustSurface = true;
 		}
@@ -200,8 +223,18 @@ public final class ServerNavigationController implements ServerController {
 			return TickResult.running(currentProgress());
 		}
 		surfacingSinceMs = -1L;
-		MinecraftNavigationWorld world = new MinecraftNavigationWorld(player.level());
+		MinecraftNavigationWorld world = navigationWorld(player.level());
 		if (navigationStartPosition == null) navigationStartPosition = player.position();
+		if (plan == null && blockedMoveTracking) {
+			BlockedMoveDetector.Decision blockedDecision = blockedMoveDetector.observe(
+					player.horizontalCollision, groundedOnLand(player), blockedMoveJumpPending, blockedMoveStepUp,
+					player.getX(), player.getZ(), nowEpochMs);
+			blockedMoveTracking = blockedDecision != BlockedMoveDetector.Decision.CONTINUE
+					|| player.horizontalCollision && groundedOnLand(player) && !blockedMoveJumpPending && !blockedMoveStepUp;
+			if (blockedDecision == BlockedMoveDetector.Decision.FAIL) {
+				return fail(player, "PATH_BLOCKED", "Navigation remained blocked after three seconds", currentProgress());
+			}
+		}
 		if (plan == null) {
 			TickResult planned = replan(player, world, nowEpochMs, elapsedMs, false);
 			if (planned != null) return planned;
@@ -211,10 +244,12 @@ public final class ServerNavigationController implements ServerController {
 		if (endpointResult != null) return endpointResult;
 		List<PathNode> nodes = plan.nodes();
 		if (waypointIndex >= nodes.size()) {
+			noteReplan("waypoints-exhausted", player);
 			return replanOrResult(player, world, nowEpochMs, elapsedMs);
 		}
 		PathNode waypoint = nodes.get(waypointIndex);
 		if (!world.isTraversable(waypoint.position())) {
+			noteReplan("waypoint-not-traversable", player);
 			TickResult replanned = replan(player, world, nowEpochMs, elapsedMs, true);
 			if (replanned != null) return replanned;
 			nodes = plan.nodes();
@@ -229,6 +264,17 @@ public final class ServerNavigationController implements ServerController {
 			progress.waypointAdvanced(player.position().distanceTo(
 					targetFor(world, waypoint, waypointIndex == nodes.size() - 1)), nowEpochMs);
 		}
+		if (player.onGround() && waypointIndex < nodes.size() - 1) {
+			Vec3 waypointCenter = center(waypoint.position());
+			if (passedWaypoint(world, player.position(), nodes, waypointIndex,
+					world.supportHeight(waypoint.position(), waypointCenter.x, waypointCenter.z))) {
+				// A body that clears a short step lands on the supporting block's far side: the waypoint is behind it.
+				waypointIndex++;
+				waypoint = nodes.get(waypointIndex);
+				progress.waypointAdvanced(player.position().distanceTo(
+						targetFor(world, waypoint, waypointIndex == nodes.size() - 1)), nowEpochMs);
+			}
+		}
 		if (!eyesUnderWater && world.isSubmerged(waypoint.position())
 				&& !SwimPlanning.breathCovers(player.getAirSupply(), submergedNodesAhead(world, nodes, waypointIndex))) {
 			// Catch breath before the dive, as a player does: air refills while the eyes are above water.
@@ -238,12 +284,39 @@ public final class ServerNavigationController implements ServerController {
 		boolean finalWaypoint = waypointIndex == nodes.size() - 1;
 		Vec3 target = targetFor(world, waypoint, finalWaypoint);
 		boolean reached = reachedTarget(world, player.position(), waypoint, finalWaypoint);
+		boolean jumpPending = jumpPending(player, world, waypoint, target);
+		boolean stepUp = waypoint.traversal() == TraversalType.JUMP_UP;
+		if (reached) {
+			blockedMoveDetector.reset();
+			blockedMoveTracking = false;
+		} else {
+			blockedMoveJumpPending = jumpPending;
+			blockedMoveStepUp = stepUp;
+			blockedMoveTracking = player.horizontalCollision && groundedOnLand(player) && !jumpPending && !stepUp;
+		}
+		BlockedMoveDetector.Decision blockedDecision = reached ? BlockedMoveDetector.Decision.CONTINUE
+				: blockedMoveDetector.observe(player.horizontalCollision, groundedOnLand(player), jumpPending, stepUp,
+						player.getX(), player.getZ(), nowEpochMs);
+		if (blockedDecision == BlockedMoveDetector.Decision.FAIL) {
+			return fail(player, "PATH_BLOCKED", "Navigation remained blocked after three seconds", lastProgressValue);
+		}
+		if (blockedDecision == BlockedMoveDetector.Decision.REPLAN) {
+			noteReplan("blocked", player);
+			TickResult replanned = replan(player, world, nowEpochMs, elapsedMs, true);
+			if (replanned != null) return replanned;
+			nodes = plan.nodes();
+			waypoint = nodes.get(waypointIndex);
+			finalWaypoint = waypointIndex == nodes.size() - 1;
+			target = targetFor(world, waypoint, finalWaypoint);
+			reached = reachedTarget(world, player.position(), waypoint, finalWaypoint);
+		}
 		double activeWaypointDistance = player.position().distanceTo(target);
 		WaypointProgress.Update update = progress.observe(activeWaypointDistance, reached, nowEpochMs);
 		lastProgressValue = navigationProgress(player.position());
 		if (reached) {
 			waypointIndex++;
 			if (waypointIndex >= nodes.size()) {
+				noteReplan("waypoints-exhausted-after-reach", player);
 				return replanOrResult(player, world, nowEpochMs, elapsedMs);
 			}
 			waypoint = nodes.get(waypointIndex);
@@ -255,6 +328,7 @@ public final class ServerNavigationController implements ServerController {
 			return fail(player, "PATH_BLOCKED", "Navigation could not recover from repeated stalls", lastProgressValue);
 		}
 		if (update.decision() == WaypointProgress.Decision.REPLAN) {
+			noteReplan("stalled", player);
 			TickResult replanned = replan(player, world, nowEpochMs, elapsedMs, true);
 			if (replanned != null) return replanned;
 			waypoint = plan.nodes().get(waypointIndex);
@@ -262,9 +336,11 @@ public final class ServerNavigationController implements ServerController {
 		}
 		List<PathNode> active = plan.nodes();
 		int steerIndex = waypoint.traversal() == TraversalType.WALK && player.onGround()
-				? steeringIndex(world, player.position(), active, waypointIndex) : waypointIndex;
+				? steeringIndex(world, player.position(), active, waypointIndex)
+				: fallingSteerIndex(active, waypointIndex, player.onGround());
 		Vec3 steer = steerIndex == waypointIndex ? target
 				: targetFor(world, active.get(steerIndex), steerIndex == active.size() - 1);
+		diagnosticTarget = target;
 		drive(player, world, waypoint, target, steer, steerIndex == active.size() - 1, steerIndex == waypointIndex, nowEpochMs);
 		return TickResult.running(lastProgressValue);
 	}
@@ -384,7 +460,7 @@ public final class ServerNavigationController implements ServerController {
 	 */
 	public AuthoritativeState authoritativeState(ServerPlayer player, long observedAtEpochMs) {
 		Objects.requireNonNull(player, "player must not be null");
-		MinecraftNavigationWorld world = new MinecraftNavigationWorld(player.level());
+		MinecraftNavigationWorld world = navigationWorld(player.level());
 		Vec3 position = player.position();
 		lastProgressValue = navigationProgress(position);
 		boolean endpointStandable = resolvedEndpointPosition != null && resolvedEndpointTarget != null
@@ -600,6 +676,10 @@ public final class ServerNavigationController implements ServerController {
 			while (previousFrontiers.size() > 64) previousFrontiers.remove(previousFrontiers.getFirst());
 		}
 		plan = candidate;
+		if (TICK_DIAGNOSTICS_ENABLED) {
+			LOGGER.info("NAV_PLAN tick={} nodes={} finalSegment={} recovery={} expanded={}",
+					player.level().getGameTime(), candidate.nodes().size(), finalSegment, recovery, candidate.expandedNodes());
+		}
 		if (finalSegment) {
 			PathNode finalNode = candidate.nodes().get(candidate.nodes().size() - 1);
 			resolvedEndpointTarget = null;
@@ -696,7 +776,6 @@ public final class ServerNavigationController implements ServerController {
 			long nowEpochMs
 	) {
 		boolean gapJump = waypoint.traversal() == TraversalType.JUMP_GAP;
-		boolean shallowWater = world.isShallowWater(waypoint.position());
 		boolean swimming = waypoint.traversal() == TraversalType.SWIM || player.isInWater();
 		// Over a submerged-floor endpoint let go of space and sink onto it, as a player does to stand on a flooded floor.
 		boolean settleOnFloor = waypoint.position().equals(resolvedEndpointPosition) && submergedFloor(world, waypoint.position());
@@ -735,12 +814,7 @@ public final class ServerNavigationController implements ServerController {
 			if (wall != null) targetYaw = (float) Math.toDegrees(Math.atan2(-wall.getStepX(), wall.getStepZ()));
 			moveYaw = Float.NaN;
 		}
-		double targetDx = target.x - player.getX();
-		double targetDz = target.z - player.getZ();
-		boolean jump = jumpNeeded(waypoint.traversal(), target.y - player.getY(),
-				Math.sqrt(targetDx * targetDx + targetDz * targetDz))
-				|| shallowWater || SwimPlanning.navigationJump(swimming, target.y - player.getY(), settleOnFloor)
-				|| (climbing && target.y > player.getY() + 0.15D);
+		boolean jump = jumpPending(player, world, waypoint, target);
 		// With sprint requested, sprint-swim while the eyes are under water (faster, steered by the view pitch).
 		boolean sprintSwim = sprint && !settleOnFloor && SwimPlanning.swimSprint(player.isInWater(), player.isUnderWater(),
 				1.0F, player.getFoodData().getFoodLevel());
@@ -763,6 +837,77 @@ public final class ServerNavigationController implements ServerController {
 				false, false, step.state().yaw(), step.state().pitch(),
 				player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND
 		));
+	}
+
+	/** Wading is slow and a current can pin the body against a wall, so the fast blocked rule only judges dry ground. */
+	private static boolean groundedOnLand(ServerPlayer player) {
+		return player.onGround() && !player.isInWater();
+	}
+
+	private boolean jumpPending(ServerPlayer player, MinecraftNavigationWorld world, PathNode waypoint, Vec3 target) {
+		boolean shallowWater = world.isShallowWater(waypoint.position());
+		boolean swimming = waypoint.traversal() == TraversalType.SWIM || player.isInWater();
+		boolean settleOnFloor = waypoint.position().equals(resolvedEndpointPosition) && submergedFloor(world, waypoint.position());
+		boolean climbing = waypoint.traversal() == TraversalType.CLIMB;
+		double targetDx = target.x - player.getX();
+		double targetDz = target.z - player.getZ();
+		return jumpNeeded(waypoint.traversal(), target.y - player.getY(),
+				Math.sqrt(targetDx * targetDx + targetDz * targetDz))
+				|| shallowWater || SwimPlanning.navigationJump(swimming, target.y - player.getY(), settleOnFloor)
+				|| (climbing && target.y > player.getY() + 0.15D);
+	}
+
+	private MinecraftNavigationWorld navigationWorld(net.minecraft.server.level.ServerLevel level) {
+		if (navigationWorld == null || !navigationWorld.belongsTo(level) || !navigationWorld.isCurrent()) {
+			navigationWorld = new MinecraftNavigationWorld(level);
+		}
+		return navigationWorld;
+	}
+
+	private void noteReplan(String reason, ServerPlayer player) {
+		if (!TICK_DIAGNOSTICS_ENABLED) return;
+		LOGGER.info("NAV_REPLAN tick={} reason={} onGround={} waypoint={}/{}",
+				player.level().getGameTime(), reason, player.onGround(), waypointIndex, plan == null ? 0 : plan.nodes().size());
+	}
+
+	private void logTickDiagnostics(ServerPlayer player, long durationNanos) {
+		Vec3 position = player.position();
+		Vec3 velocity = player.getDeltaMovement();
+		Vec3 previous = diagnosticPreviousPosition;
+		diagnosticPreviousPosition = position;
+		String delta = previous == null ? "-" : String.format(java.util.Locale.ROOT, "%.4f,%.4f,%.4f",
+				position.x - previous.x, position.y - previous.y, position.z - previous.z);
+		String lease = "-";
+		String winner = "-";
+		try {
+			var agentId = AgentInputRuntime.findAgentId(player).orElse(null);
+			if (agentId != null) {
+				var controller = AgentInputRuntime.existingController(player.level().getServer()).orElse(null);
+				if (controller == null) throw new IllegalStateException("input controller is unavailable");
+				var winningLease = controller.currentWinner(agentId).orElse(null);
+				var winningState = controller.currentState(agentId).orElse(null);
+				if (winningLease != null) lease = winningLease.owner() + ":" + winningLease.priority() + ":" + winningLease.sequence();
+				if (winningState != null) winner = String.format(java.util.Locale.ROOT,
+						"f%.2f,s%.2f,j%s,sp%s,y%.1f,p%.1f", winningState.forward(), winningState.strafe(),
+						winningState.jump(), winningState.sprint(), winningState.yaw(), winningState.pitch());
+			}
+		} catch (RuntimeException error) {
+			lease = "unavailable:" + error.getClass().getSimpleName();
+		}
+		String traversal = plan == null || waypointIndex >= plan.nodes().size()
+				? "-" : plan.nodes().get(waypointIndex).traversal().name();
+		LOGGER.info("NAV_TICK tick={} elapsedMs={} durationUs={} pos={},{},{} dpos={} vel={},{},{} "
+				+ "ground={} hcoll={} vcoll={} motor={} winner={} lease={} planNodes={} prep={} search={} waypoint={}/{} traversal={} "
+				+ "fallDistance={} hurtTime={} hurtMarked={} target={}",
+				player.level().getGameTime(), elapsedTime.elapsedMs(), durationNanos / 1_000L,
+				position.x, position.y, position.z, delta, velocity.x, velocity.y, velocity.z,
+				player.onGround(), player.horizontalCollision, player.verticalCollision,
+				motorState == null ? "-" : String.format(java.util.Locale.ROOT, "f%.2f,s%.2f,j%s,sp%s",
+						motorState.forward(), motorState.strafe(), motorState.jumpHeld(), lastSprint),
+				winner, lease, plan == null ? 0 : plan.nodes().size(), preparation != null,
+				search != null, waypointIndex, plan == null ? 0 : plan.nodes().size(), traversal,
+				player.fallDistance, player.hurtTime, player.hurtMarked,
+				diagnosticTarget == null ? "-" : String.format(java.util.Locale.ROOT, "%.2f,%.2f,%.2f", diagnosticTarget.x, diagnosticTarget.y, diagnosticTarget.z));
 	}
 
 	/**
@@ -861,22 +1006,77 @@ public final class ServerNavigationController implements ServerController {
 		return best;
 	}
 
-	/** Index of a walk node within the lookahead window whose cell holds the player's feet, or -1. */
+	/**
+	 * Index of a node within the lookahead window whose cell holds the player's feet, or -1. Nodes before it must be
+	 * walk or drop nodes, which a body can step past or fly over, except that the waypoint itself may also be the
+	 * landing of a gap jump or step-up. A body that overshoots a landing, or clears a short step on the way down, is
+	 * already standing in a later cell; requiring it to walk back onto the skipped cell first cost about a second
+	 * after most drops (measured on a headless server).
+	 */
 	static int occupiedWalkNode(List<PathNode> nodes, int index, GridPosition feet) {
 		int last = Math.min(nodes.size() - 2, index + STEERING_LOOKAHEAD_NODES);
 		for (int candidate = index; candidate <= last; candidate++) {
 			PathNode node = nodes.get(candidate);
-			if (node.traversal() != TraversalType.WALK) return -1;
+			TraversalType traversal = node.traversal();
+			boolean passable = traversal == TraversalType.WALK || traversal == TraversalType.DROP_DOWN
+					|| candidate == index && (traversal == TraversalType.JUMP_GAP || traversal == TraversalType.JUMP_UP);
+			if (!passable) return -1;
 			if (node.position().equals(feet)) return candidate;
 		}
 		return -1;
 	}
 
+	/**
+	 * True when a grounded body at a walk or drop waypoint's level has gone past it toward the next walk or drop node,
+	 * within {@link #HOLD_HEADING_DISTANCE} of its center. Without this the controller stepped back onto the waypoint
+	 * (the heading hold below), though a player just keeps going down the stairs. A body standing in a later path cell
+	 * is passed on by {@link #occupiedWalkNode}; anywhere else it must still have walkable support under the whole
+	 * swept hitbox on the way to the next node, so a body shoved off a narrow bridge or ledge corner is not waved on
+	 * across the gap.
+	 */
+	static boolean passedWaypoint(WalkabilityView world, Vec3 position, List<PathNode> nodes, int index, double supportY) {
+		if (index < 0 || index + 1 >= nodes.size() || !Double.isFinite(supportY)) return false;
+		PathNode node = nodes.get(index);
+		PathNode next = nodes.get(index + 1);
+		if (!walksOrFalls(node.traversal()) || !walksOrFalls(next.traversal())) return false;
+		if (Math.abs(position.y - supportY) > PASSED_LEVEL_TOLERANCE) return false;
+		double dx = position.x - (node.position().x() + 0.5D);
+		double dz = position.z - (node.position().z() + 0.5D);
+		if (dx * dx + dz * dz > HOLD_HEADING_DISTANCE * HOLD_HEADING_DISTANCE) return false;
+		if (dx * (next.position().x() - node.position().x()) + dz * (next.position().z() - node.position().z()) <= 0.0D) {
+			return false;
+		}
+		return clearWalkLine(world, position, center(next.position()), node.position().y(), next.position().y());
+	}
+
+	private static boolean walksOrFalls(TraversalType traversal) {
+		return traversal == TraversalType.WALK || traversal == TraversalType.DROP_DOWN;
+	}
+
+	/**
+	 * While falling toward a drop landing that is not the endpoint, keep walking along the path: a player holds the
+	 * same key through the fall instead of pressing back toward the landing cell's center, which cancelled sprint
+	 * in the air and slowed every landing.
+	 */
+	static int fallingSteerIndex(List<PathNode> nodes, int index, boolean onGround) {
+		if (onGround || index + 1 >= nodes.size() || nodes.get(index).traversal() != TraversalType.DROP_DOWN) return index;
+		return index + 1;
+	}
+
 	static boolean clearWalkLine(WalkabilityView world, Vec3 from, Vec3 to, int level) {
-		return clearWalkLineWithScratch(world, from, to, level, CLEAR_WALK_LINE_SCRATCH.get());
+		return clearWalkLine(world, from, to, level, level);
+	}
+
+	/** As above for a leg that changes level: each swept cell must be standable at either of the two levels. */
+	static boolean clearWalkLine(WalkabilityView world, Vec3 from, Vec3 to, int level, int otherLevel) {
+		return clearWalkLineWithScratch(world, from, to, level, otherLevel, CLEAR_WALK_LINE_SCRATCH.get());
 	}
 
 	static boolean clearWalkLineWithScratch(WalkabilityView world, Vec3 from, Vec3 to, int level, long[] checked) {
+		return clearWalkLineWithScratch(world, from, to, level, level, checked);
+	}
+
+	static boolean clearWalkLineWithScratch(WalkabilityView world, Vec3 from, Vec3 to, int level, int otherLevel, long[] checked) {
 		double dx = to.x - from.x;
 		double dz = to.z - from.z;
 		int samples = Math.max(1, (int) Math.ceil(Math.sqrt(dx * dx + dz * dz) / STEERING_SAMPLE_SPACING));
@@ -902,7 +1102,10 @@ public final class ServerNavigationController implements ServerController {
 				checked[cursor] = key;
 				cursor = (cursor + 1) % checked.length;
 				checkedCount = Math.min(checkedCount + 1, checked.length);
-				if (world.traversalAt(new GridPosition(cellX, level, cellZ)) != TraversalType.WALK) return false;
+				if (world.traversalAt(new GridPosition(cellX, level, cellZ)) == TraversalType.WALK) continue;
+				if (otherLevel == level || world.traversalAt(new GridPosition(cellX, otherLevel, cellZ)) != TraversalType.WALK) {
+					return false;
+				}
 			}
 		}
 		return true;

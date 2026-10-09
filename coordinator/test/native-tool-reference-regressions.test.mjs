@@ -34,8 +34,8 @@ test('focused sequence reference advertises finish with an accepted executable c
 });
 
 test('ArenaScript movement documentation distinguishes moveTo from timed navigateTo', () => {
-	assert.match(ARENA_SCRIPT_API_REFERENCE, /moveTo and navigateTo require tolerance 0\.01\.\.16 and sprint boolean; only navigateTo accepts timeoutMs \(required, 1\.\.600000\)/);
-	assert.match(SCRIPT_ACTION_REFERENCE, /player\.moveTo\(\{ x, y, z, tolerance, sprint \}\)/);
+	assert.match(ARENA_SCRIPT_API_REFERENCE, /moveTo requires tolerance 0\.01\.\.16 \(sprint boolean, default true\); navigateTo also requires sprint and timeoutMs 1\.\.600000/);
+	assert.match(SCRIPT_ACTION_REFERENCE, /player\.moveTo\(\{ x, y, z, tolerance, sprint\? \}\)/);
 	assert.match(SCRIPT_ACTION_REFERENCE, /player\.navigateTo\(\{ x, y, z, tolerance, sprint, timeoutMs \}\)/);
 	for (const [member, primitive, args] of [
 		['moveTo', 'move_to', { x: 1, y: 64, z: 2, tolerance: 1, sprint: true }],
@@ -48,6 +48,17 @@ test('ArenaScript movement documentation distinguishes moveTo from timed navigat
 		assert.deepEqual({ ...step.call.arguments }, args);
 		assert.doesNotThrow(() => validateAction({ type: primitive, ...step.call.arguments }));
 	}
+});
+
+test('ArenaScript moveTo without sprint passes the shared validator and sprints by default', () => {
+	const run = (args) => {
+		const vm = new ArenaScriptInterpreter(parseArenaScript(`program.onUnhandledAttention("pause_and_notify"); await player.moveTo(${JSON.stringify(args)});`), SCRIPT_BINDINGS);
+		const step = vm.start(createInterpreterFacts({ player: { health: 20 }, inventory: { items: [] }, blocks: [], entities: [], items: [] }));
+		assert.equal(step.kind, 'command');
+		return validateAction({ type: step.call.primitive, ...step.call.arguments });
+	};
+	assert.equal(run({ x: 1, y: 64, z: 2, tolerance: 1 }).sprint, true);
+	assert.equal(run({ x: 1, y: 64, z: 2, tolerance: 1, sprint: false }).sprint, false);
 });
 
 test('postAction tools point to one complete observation-view contract without changing schemas', () => {
