@@ -71,7 +71,8 @@ export const callCount = () => calls;
 export async function reap(method, path, body, { idempotent = false, idempotencyKey, headers = {}, retries = 3, inProgressWaits = 10, inProgressWaitMs = 1000 } = {}) {
   const key = process.env.REAP_API_KEY;
   if (!key) throw new Error('REAP_API_KEY missing: put it in reap/.env as REAP_API_KEY=...');
-  // One key per logical operation, reused across network/429/5xx retries (docs: cached errors replay).
+  // One key per logical operation, reused only across network/429 retries. Reap caches a 5xx under its key,
+  // so an idempotent 5xx is thrown and the caller retries with a fresh key.
   const idem = idempotent ? (idempotencyKey || randomUUID()) : null;
   let waits = 0;
   for (let attempt = 0; ; attempt++) {
@@ -104,7 +105,7 @@ export async function reap(method, path, body, { idempotent = false, idempotency
       await sleep(after > 0 ? after * 1000 : inProgressWaitMs);
       continue;
     }
-    const retryable = res.status === 429 || res.status >= 500;
+    const retryable = res.status === 429 || (res.status >= 500 && !idem);
     if (retryable && attempt < retries) {
       const after = Number(res.headers.get('retry-after'));
       await sleep(after > 0 ? after * 1000 : 500 * 2 ** attempt);
@@ -158,14 +159,26 @@ export const getQuote = (id) => reap('GET', `/agentic/quotes/${id}`);
 export const selectShipping = (quoteId, shippingOptionId) =>
   reap('POST', `/agentic/quotes/${quoteId}/shipping-option`, { shippingOptionId });
 
-export const createCheckout = (quoteId, enrollmentId, { simulate = false, inProgressWaitMs } = {}) =>
-  reap('POST', '/agentic/checkouts', {
-    quoteId, enrollmentId, presentation: { type: 'REDIRECT', returnUrl: RETURN_URL },
-  }, {
-    idempotent: true, idempotencyKey: checkoutIdempotencyKey(quoteId, enrollmentId),
-    headers: simulate ? { 'X-Simulate-Checkout': 'COMPLETED' } : {},
-    ...(inProgressWaitMs === undefined ? {} : { inProgressWaitMs }),
-  });
+export async function createCheckout(quoteId, enrollmentId, { simulate = false, inProgressWaitMs } = {}) {
+  try {
+    return await reap('POST', '/agentic/checkouts', {
+      quoteId, enrollmentId, presentation: { type: 'REDIRECT', returnUrl: RETURN_URL },
+    }, {
+      idempotent: true, idempotencyKey: checkoutIdempotencyKey(quoteId, enrollmentId),
+      headers: simulate ? { 'X-Simulate-Checkout': 'COMPLETED' } : {},
+      ...(inProgressWaitMs === undefined ? {} : { inProgressWaitMs }),
+    });
+  } catch (e) {
+    // The 5xx is cached under this key; forget it so the next checkout of this quote gets a fresh key.
+    if (e instanceof ReapError && e.status >= 500) forgetCheckoutKey(quoteId);
+    throw e;
+  }
+}
+
+function forgetCheckoutKey(quoteId) {
+  const { [quoteId]: _gone, ...rest } = loadState().checkoutKeys || {};
+  saveState({ checkoutKeys: rest });
+}
 export const getCheckout = (id) => reap('GET', `/agentic/checkouts/${id}`);
 
 const TERMINAL = new Set(['COMPLETED', 'FAILED', 'EXPIRED']);

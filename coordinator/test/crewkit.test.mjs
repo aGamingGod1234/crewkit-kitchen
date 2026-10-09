@@ -447,3 +447,37 @@ test('edge 2: getCheckout errors back off pollEveryMs each time and stop with PO
   assert.ok(sleeps.filter((ms) => ms === 7).length >= 10, 'every poll error sleeps pollEveryMs');
   assert.equal(names(stream.log).at(-1), 'failed');
 });
+
+test('edge 3: idempotent POSTs retry 429 with the same key but throw on 5xx; checkout 5xx forgets the persisted key', async () => {
+  const stateFile = path.join(process.env.CREWKIT_RECORDS_DIR, 'state-edge3.json');
+  const saved = { key: process.env.REAP_API_KEY, state: process.env.CREWKIT_STATE_FILE, fetch: globalThis.fetch };
+  process.env.CREWKIT_STATE_FILE = stateFile;
+  process.env.REAP_API_KEY = 'test-key-not-real'; // fetch is mocked below; nothing leaves the process
+  const client = await import('../src/crewkit/reap-client.mjs');
+  const seen = [];
+  const replies = [];
+  globalThis.fetch = async (url, init) => {
+    seen.push(init.headers['Idempotency-Key']);
+    const [status, body] = replies.shift();
+    return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', 'retry-after': '0.001' } });
+  };
+  try {
+    replies.push([429, { error: { code: 'RATE_LIMITED' } }], [200, { id: 'chk' }]);
+    assert.equal((await client.createCheckout('q-a', 'enr')).id, 'chk');
+    assert.equal(seen.length, 2);
+    assert.equal(seen[0], seen[1], '429 retried with the same key');
+    seen.length = 0;
+    replies.push([503, { error: { code: 'UNAVAILABLE' } }], [200, { id: 'never' }]);
+    await assert.rejects(client.createCheckout('q-b', 'enr'), (e) => e.status === 503);
+    assert.equal(seen.length, 1, 'idempotent 5xx is not retried with the same key');
+    assert.ok(!('q-b' in (JSON.parse(readFileSync(stateFile, 'utf8')).checkoutKeys || {})), 'checkout key forgotten after 5xx');
+    replies.length = 0;
+    replies.push([200, { id: 'chk2' }]);
+    await client.createCheckout('q-b', 'enr');
+    assert.notEqual(seen[1], seen[0], 'next checkout of the quote uses a fresh key');
+  } finally {
+    globalThis.fetch = saved.fetch;
+    if (saved.key === undefined) delete process.env.REAP_API_KEY; else process.env.REAP_API_KEY = saved.key;
+    if (saved.state === undefined) delete process.env.CREWKIT_STATE_FILE; else process.env.CREWKIT_STATE_FILE = saved.state;
+  }
+});
