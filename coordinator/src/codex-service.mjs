@@ -17,6 +17,10 @@ import { ContextCarryOver, DEFAULT_CONTEXT_ROTATION_TOKENS, MIN_TURNS_BETWEEN_RO
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_DECISION_BYTES = 256 * 1_024;
+// Interrupting a turn at a tool boundary and continuing on a warm thread (see rotateAtToolBoundary). Off by default: it cut
+// cost index about 29% on a 70-block turn, but the model lost a fact it had seen once and not written down (0 of 3 runs kept it,
+// against 3 of 3 without). Completed-turn rotation is separate and stays on.
+const DEFAULT_CODEX_MID_TURN_ROTATION = false;
 const THREAD_START_TIMEOUT_MS = 60_000;
 const MAX_BUFFERED_TURN_NOTIFICATIONS = 4_096;
 const MAX_PUBLIC_AGENT_MESSAGE_CANDIDATE_CHARS = 1_280;
@@ -248,6 +252,7 @@ export class CodexService {
 			reportedSettings: response,
 			rotateThread,
 			contextRotationTokens: rotationTokens,
+			midTurnRotation: this.#config.midTurnContextRotation,
 		});
 		if (lifecycleGeneration !== this.#lifecycleGeneration) {
 			await agent.dispose();
@@ -435,6 +440,11 @@ export class SharedCodexAgent {
 	#rotations = 0;
 	#pendingCarryOver = null;
 	#carryOver = new ContextCarryOver();
+	#routeEpoch = 0;
+	#standbyThreadId = null;
+	#standbyThreadPromise = null;
+	#rotationWarmupFailed = false;
+	#midTurnRotation = DEFAULT_CODEX_MID_TURN_ROTATION;
 
 	constructor(profile, threadId, transport, dependencies = {}) {
 		this.#profile = structuredClone(profile);
@@ -455,6 +465,7 @@ export class SharedCodexAgent {
 		this.#recordEffectiveSettings(dependencies.reportedSettings, false);
 		this.#rotateThread = typeof dependencies.rotateThread === 'function' ? dependencies.rotateThread : null;
 		this.#rotationTokens = Number.isSafeInteger(dependencies.contextRotationTokens) ? dependencies.contextRotationTokens : 0;
+		if (typeof dependencies.midTurnRotation === 'boolean') this.#midTurnRotation = dependencies.midTurnRotation;
 		if (this.#controlProtocol === 'native_tools') {
 			// Keep the latest observed counter even between turns. An absent baseline
 			// stays unknown; a newly attached session does not imply a zero bill.
@@ -466,7 +477,10 @@ export class SharedCodexAgent {
 					this.#nativeUsageTotal = codexTokenUsage(params?.tokenUsage?.total);
 				}
 				if (method === 'thread/tokenUsage/updated' && params?.threadId === this.#threadId && this.#rotationTokens > 0
-					&& (codexTokenUsage(params?.tokenUsage?.last)?.input ?? 0) >= this.#rotationTokens) this.#rotationDue = true;
+					&& (codexTokenUsage(params?.tokenUsage?.last)?.input ?? 0) >= this.#rotationTokens) {
+					this.#rotationDue = true;
+					if (this.#midTurnRotation && this.#active !== null && this.#turnsSinceRotation + 1 >= MIN_TURNS_BETWEEN_ROTATIONS) void this.#prepareRotationThread();
+				}
 			};
 			this.#transport.on('notification', this.#onNativeNotification);
 		}
@@ -509,7 +523,6 @@ export class SharedCodexAgent {
 		if (revision < this.#goalRevision) throw new CodexProtocolError('STALE_GOAL_REVISION', `Goal revision ${revision} is older than ${this.#goalRevision}`);
 		if (revision === this.#goalRevision) return;
 		this.#goalRevision = revision;
-		this.#observationViews.reset();
 		if (this.#active !== null && this.#active.goalRevision !== revision) await this.interrupt();
 	}
 
@@ -683,13 +696,13 @@ export class SharedCodexAgent {
 		if (!prewarm && this.#prewarmPromise !== null) {
 			try { await this.#prewarmPromise; } catch { /* a real event continues cold after a failed or interrupted prewarm */ }
 		}
-		// An event never waits for a thread start: it runs on the current thread and the unfinished rotation is dropped
-		// (a later finished turn tries again).
+		// A late completed-turn thread start must not hold up this event; its generation will be dropped.
 		if (this.#rotationPromise !== null) {
 			this.#rotationGeneration += 1;
 			this.#rotationPromise = null;
 		}
 		if (this.#active !== null) throw new CodexProtocolError('TURN_IN_PROGRESS', `Codex agent '${this.agentId}' already has an active turn`);
+		this.#rotationWarmupFailed = false;
 		const carryOver = this.#carryOver;
 		const rememberingExecuteTool = this.#rememberingTools(executeTool);
 		let completed = false;
@@ -697,38 +710,59 @@ export class SharedCodexAgent {
 		const silenceDeadline = createProviderSilenceDeadline(this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
 		let receivedUsageTotal = false;
 		let executingTools = 0;
-		const collector = createNativeTurnCollector({
-			transport: this.#transport,
-			threadId: this.#threadId,
-			agentId: this.agentId,
-			goalRevision,
-			executeTool: prewarm ? executeTool : rememberingExecuteTool,
-			onVerbose,
-			observationViews: this.#observationViews,
-			usageStart: this.#nativeUsageTotal,
-			usagePreviousEnd: this.#nativeUsagePreviousEnd,
-			onUsageTotal: (total) => {
-				this.#nativeUsageTotal = total;
-				if (total !== null) receivedUsageTotal = true;
-			},
-			onProviderActivity: () => {
-				silenceDeadline.restart();
-				if (this.#active?.collector === collector) this.#active.onProgress?.({ phase: 'provider' });
-			},
-			onToolTiming: (metadata) => {
-				if (this.#active?.collector === collector) return this.#active.onProgress?.(metadata);
-			},
-			onToolExecutionStart: () => { executingTools++; silenceDeadline.pause(); },
-			onToolExecutionEnd: () => { if (--executingTools === 0) silenceDeadline.resume(); },
-		});
-		void collector.promise.catch(() => {});
 		let lifecycleSettled = false;
 		let rejectLifecycle;
 		const lifecyclePromise = new Promise((_, reject) => { rejectLifecycle = reject; });
-		const active = {
+		let active = null;
+		let rotateAtToolBoundary = async () => false;
+		const turnCollectors = new Set();
+		const createCollector = (threadId, routeEpoch) => {
+			let created;
+			created = createNativeTurnCollector({
+				transport: this.#transport,
+				threadId,
+				agentId: this.agentId,
+				goalRevision,
+				executeTool: prewarm ? executeTool : rememberingExecuteTool,
+				onVerbose,
+				observationViews: this.#observationViews,
+				usageStart: threadId === this.#threadId ? this.#nativeUsageTotal : { input: 0, output: 0, reasoning: 0, cached: 0, cacheWrite: 0 },
+				usagePreviousEnd: threadId === this.#threadId ? this.#nativeUsagePreviousEnd : null,
+				isRouteCurrent: () => this.#active === active && active?.collector === created && active.routeEpoch === routeEpoch && !active.handoffPending,
+				onInputObserved: () => { if (this.#active?.collector === created) active.modelObserved = true; },
+				onAgentMessage: (text) => { if (!prewarm && this.#active?.collector === created) this.#carryOver.noteAgentMessage(text); },
+				onUsageTotal: (total) => {
+					if (this.#active?.collector !== created) return;
+					this.#nativeUsageTotal = total;
+					if (total !== null) receivedUsageTotal = true;
+				},
+				onProviderActivity: () => {
+					silenceDeadline.restart();
+					if (this.#active?.collector === created) this.#active.onProgress?.({ phase: 'provider' });
+				},
+				onToolTiming: (metadata) => {
+					if (this.#active?.collector === created) return this.#active.onProgress?.(metadata);
+				},
+				onToolResult: (metadata) => rotateAtToolBoundary({ ...metadata, collector: created, routeEpoch }),
+				onToolExecutionStart: () => { executingTools++; silenceDeadline.pause(); },
+				onToolExecutionEnd: () => { if (--executingTools === 0) silenceDeadline.resume(); },
+			});
+			turnCollectors.add(created);
+			void created.promise.catch(() => {});
+			return created;
+		};
+		const initialThreadId = this.#threadId;
+		const initialEpoch = ++this.#routeEpoch;
+		const collector = createCollector(initialThreadId, initialEpoch);
+		active = {
 			goalRevision,
 			prewarm,
 			onProgress,
+			threadId: initialThreadId,
+			routeEpoch: initialEpoch,
+			handoffPending: false,
+			latestInput: input,
+			modelObserved: false,
 			turnId: null,
 			turnStartPromise: null,
 			collector,
@@ -740,6 +774,94 @@ export class SharedCodexAgent {
 			},
 		};
 		this.#active = active;
+		if (!prewarm && this.#midTurnRotation && this.#rotationDue && this.#turnsSinceRotation + 1 >= MIN_TURNS_BETWEEN_ROTATIONS) void this.#prepareRotationThread();
+		rotateAtToolBoundary = async ({ collector: oldCollector, routeEpoch, pendingCount, tool, result, claimSteer }) => {
+			if (prewarm || !this.#midTurnRotation || pendingCount !== 1 || !this.#rotationDue || this.#rotateThread === null
+				|| this.#turnsSinceRotation + 1 < MIN_TURNS_BETWEEN_ROTATIONS || this.#rotationWarmupFailed
+				|| this.#active !== active || active.collector !== oldCollector || active.routeEpoch !== routeEpoch
+				|| this.#goalRevision !== goalRevision || signal?.aborted || this.#disposed) return false;
+			active.handoffPending = true;
+			const oldThreadId = active.threadId;
+			const oldTurnId = active.turnId;
+			const threadId = this.#standbyThreadId ?? await Promise.race([
+				this.#prepareRotationThread(),
+				new Promise((resolve) => setTimeout(() => resolve(null), 300)),
+			]);
+			if (typeof threadId !== 'string') { active.handoffPending = false; return false; }
+			if (this.#active !== active || active.collector !== oldCollector || this.#goalRevision !== goalRevision || signal?.aborted || this.#disposed) {
+				active.handoffPending = false;
+				return false;
+			}
+			try {
+				await this.#transport.request('turn/interrupt', { threadId: oldThreadId, turnId: oldTurnId }, { timeoutMs: this.#planningTimeoutMs });
+			} catch {
+				active.handoffPending = false;
+				return false;
+			}
+			// The interrupt is the point of no return, so the tool's pending steer moves to the new thread here and nowhere else.
+			const steered = await claimSteer();
+			steered?.commit?.();
+			const steerWaiters = steered?.waiters ?? [];
+			const latestInput = active.latestInput;
+			const encodedResult = JSON.stringify(encodeModelFacts(result));
+			const continuation = `${this.#carryOver.text('Mid-turn continuation')}\n\nLatest event and current facts:\n${latestInput}\n\nAlready executed tool result (do not call the tool again):\n${encodedResult}`;
+			const nextEpoch = ++this.#routeEpoch;
+			this.#activateRotationThread(threadId, null);
+			active.threadId = threadId;
+			active.routeEpoch = nextEpoch;
+			active.handoffPending = false;
+			active.turnId = null;
+			active.latestInput = continuation;
+			if (this.#active !== active || this.#goalRevision !== goalRevision || signal?.aborted || this.#disposed) {
+				this.#pendingCarryOver = continuation;
+				active.routeEpoch = nextEpoch;
+				active.threadId = threadId;
+				active.handoffPending = true;
+				oldCollector.handoff();
+				for (const waiter of steerWaiters) waiter.reject(new CodexProtocolError('TURN_NOT_ACTIVE', 'Codex turn ended before the steer reached the replacement thread'));
+				return true;
+			}
+			const nextCollector = createCollector(threadId, nextEpoch);
+			active.collector = nextCollector;
+			oldCollector.handoff();
+			nextCollector.recordInput('turn/start', continuation);
+			const turnStartPromise = this.#transport.request('turn/start', {
+				threadId,
+				input: [{ type: 'text', text: continuation }],
+				model: this.#profile.model,
+				effort: this.#profile.reasoningEffort,
+				serviceTier: this.#profile.serviceTier,
+				approvalPolicy: 'never',
+				environments: [],
+			}, { timeoutMs: this.#planningTimeoutMs });
+			active.turnStartPromise = turnStartPromise;
+			void turnStartPromise.then((response) => {
+				for (const waiter of steerWaiters) waiter.resolve({ turnId: response?.turn?.id ?? null });
+			}, (error) => {
+				for (const waiter of steerWaiters) waiter.reject(error);
+			});
+			void turnStartPromise.then((response) => {
+				try {
+					const turnId = requireNestedId(response, 'turn', 'turn/start');
+					if (this.#active !== active || active.collector !== nextCollector || this.#goalRevision !== goalRevision || lifecycleSettled || signal?.aborted || this.#disposed) {
+						void this.#transport.request('turn/interrupt', { threadId, turnId }).catch(() => {});
+						this.#pendingCarryOver = continuation;
+						return;
+					}
+					active.turnId = turnId;
+					this.#recordEffectiveSettings(response);
+					nextCollector.setTurnId(turnId);
+					silenceDeadline.restart();
+				} catch (error) {
+					this.#pendingCarryOver = continuation;
+					nextCollector.fail(error);
+				}
+			}, (error) => {
+				this.#pendingCarryOver = continuation;
+				nextCollector.fail(error);
+			});
+			return true;
+		};
 		const abort = () => {
 			active.cancel(new CodexProtocolError('STALE_PLAN', 'Codex native turn was aborted'));
 			void this.interrupt().catch(() => {});
@@ -765,13 +887,13 @@ export class SharedCodexAgent {
 			active.turnStartPromise = turnStartPromise;
 			void turnStartPromise.then((response) => {
 				const turnId = response?.turn?.id;
-				if (typeof turnId !== 'string' || (this.#active === active && !lifecycleSettled && !signal?.aborted && !this.#disposed)) return;
+				if (typeof turnId !== 'string' || (this.#active === active && active.collector === collector && !lifecycleSettled && !signal?.aborted && !this.#disposed)) return;
 				if (this.#active === active && (active.turnId === null || active.turnId === undefined)) {
 					active.turnId = turnId;
 					void this.interrupt().catch(() => {});
 					return;
 				}
-				void this.#transport.request('turn/interrupt', { threadId: this.#threadId, turnId }).catch(() => {});
+				void this.#transport.request('turn/interrupt', { threadId: initialThreadId, turnId }).catch(() => {});
 			}, () => {});
 			const response = await withTimeout(Promise.race([turnStartPromise, lifecyclePromise, collector.promise]), this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
 			active.turnId = requireNestedId(response, 'turn', 'turn/start');
@@ -783,10 +905,21 @@ export class SharedCodexAgent {
 				throw new CodexProtocolError('STALE_PLAN', 'Codex native turn started after its goal revision became obsolete');
 			}
 			silenceDeadline.restart();
-			const result = await Promise.race([collector.promise, lifecyclePromise, silenceDeadline.promise]);
+			let result;
+			while (true) {
+				const currentCollector = active.collector;
+				result = await Promise.race([currentCollector.promise, lifecyclePromise, silenceDeadline.promise]);
+				if (result?.status !== 'rotated') break;
+			}
 			if (this.#active !== active || this.#goalRevision !== goalRevision || signal?.aborted) throw new CodexProtocolError('STALE_PLAN', 'Codex native turn belongs to an obsolete goal revision');
 			this.#sessionState = 'warm';
-			if (!prewarm) { this.#turnsSinceRotation += 1; completed = true; }
+			if (!prewarm) {
+				const totalToolCalls = [...turnCollectors].reduce((sum, current) => sum + current.snapshot().toolCalls, 0);
+				result.toolCalls = totalToolCalls;
+				if (result.nativeTurn) result.nativeTurn.toolCalls = totalToolCalls;
+				this.#turnsSinceRotation += 1;
+				completed = true;
+			}
 			return result;
 		} catch (error) {
 			if (['PLANNING_TIMEOUT', 'PROVIDER_SETTINGS_MISMATCH', 'TURN_NOTIFICATION_OVERFLOW', 'TOOL_RESPONSE_DELIVERY_FAILED'].includes(error?.code)) {
@@ -794,21 +927,21 @@ export class SharedCodexAgent {
 				// accepted ID (or fence the late start) before releasing ownership.
 				try { await this.interrupt(); } catch {}
 			}
-			this.#observationViews.forgetEventMetadata();
+			if (!active.modelObserved) this.#observationViews.forgetEventView();
 			// A turn that never started cannot have delivered the carry-over; the next event sends it again.
 			if (pendingCarryOver !== null && active.turnId === null && this.#pendingCarryOver === null) this.#pendingCarryOver = pendingCarryOver;
-			throw withNativeTurn(error, collector.snapshot());
+			throw withNativeTurn(error, active.collector.snapshot());
 		} finally {
 			signal?.removeEventListener('abort', abort);
 			silenceDeadline.dispose();
 			// A turn with no counter evidence creates a gap. Do not charge its
 			// unobserved usage to the next turn by retaining an older baseline.
-			const evidence = collector.snapshot();
+			const evidence = active.collector.snapshot();
 			// A counter after collector settlement cannot repair this turn's missing
 			// attribution, but it is a valid baseline for the next observed interval.
 			if (evidence.usage.status === 'missing' && !receivedUsageTotal) this.#nativeUsageTotal = null;
 			this.#nativeUsagePreviousEnd = evidence.usage.end;
-			collector.dispose();
+			for (const currentCollector of turnCollectors) currentCollector.dispose();
 			if (this.#active === active) this.#active = null;
 			// Rotate right after a finished turn, off the next event's critical path.
 			if (completed) this.#rotateAfterTurn();
@@ -829,31 +962,62 @@ export class SharedCodexAgent {
 		};
 	}
 
+	#prepareRotationThread() {
+		if (this.#standbyThreadId !== null) return Promise.resolve(this.#standbyThreadId);
+		if (this.#standbyThreadPromise !== null) return this.#standbyThreadPromise;
+		if (this.#rotationWarmupFailed || this.#rotateThread === null || this.#disposed) return Promise.resolve(null);
+		const previousThreadId = this.#threadId;
+		const generation = ++this.#rotationGeneration;
+		let warming;
+		warming = Promise.resolve().then(() => this.#rotateThread()).then((threadId) => {
+			if (this.#disposed || this.#threadId !== previousThreadId || generation !== this.#rotationGeneration) {
+				void this.#transport.request('thread/unsubscribe', { threadId }).catch(() => {});
+				return null;
+			}
+			this.#standbyThreadId = threadId;
+			return threadId;
+		}).catch(() => {
+			if (generation === this.#rotationGeneration) this.#rotationWarmupFailed = true;
+			return null;
+		}).finally(() => { if (this.#standbyThreadPromise === warming) this.#standbyThreadPromise = null; });
+		this.#standbyThreadPromise = warming;
+		return warming;
+	}
+
+	#activateRotationThread(threadId, carryOver) {
+		const previousThreadId = this.#threadId;
+		this.#threadId = threadId;
+		this.#standbyThreadId = null;
+		this.#standbyThreadPromise = null;
+		this.#observationViews.reset();
+		this.#nativeUsageTotal = { input: 0, output: 0, reasoning: 0, cached: 0, cacheWrite: 0 };
+		this.#nativeUsagePreviousEnd = null;
+		this.#pendingCarryOver = carryOver;
+		this.#rotationDue = false;
+		this.#rotationWarmupFailed = false;
+		this.#turnsSinceRotation = 0;
+		this.#rotations += 1;
+		if (previousThreadId !== threadId) void this.#transport.request('thread/unsubscribe', { threadId: previousThreadId }).catch(() => {});
+	}
+
 	/** Moves to a fresh thread once the context passed the threshold; the next event starts with a short carry-over. */
 	#rotateAfterTurn() {
 		if (!this.#rotationDue || this.#rotateThread === null || this.#turnsSinceRotation < MIN_TURNS_BETWEEN_ROTATIONS) return;
 		if (this.#active !== null || this.#disposed || this.#rotationPromise !== null) return;
 		const carryOver = this.#carryOver.text('Session refreshed to keep context small');
 		const previousThreadId = this.#threadId;
-		const generation = ++this.#rotationGeneration;
-		const rotation = Promise.resolve().then(() => this.#rotateThread()).then((threadId) => {
-			if (this.#disposed || this.#threadId !== previousThreadId || generation !== this.#rotationGeneration || this.#active !== null) {
-				void this.#transport.request('thread/unsubscribe', { threadId }).catch(() => {});
+		const rotation = this.#prepareRotationThread().then((threadId) => {
+			if (threadId === null) {
+				if (!this.#disposed && this.#rotationDue && !this.#rotationWarmupFailed && this.#threadId === previousThreadId && this.#active === null) {
+					this.#rotationPromise = null;
+					this.#rotateAfterTurn();
+				}
 				return;
 			}
-			this.#threadId = threadId;
-			// The new thread has never seen earlier events, fact views, omitted metadata or usage counters.
-			this.#observationViews.reset();
-			// This service created the thread a moment ago, so its counters start at zero rather than unknown.
-			this.#nativeUsageTotal = { input: 0, output: 0, reasoning: 0, cached: 0, cacheWrite: 0 };
-			this.#nativeUsagePreviousEnd = null;
-			this.#pendingCarryOver = carryOver;
-			this.#rotationDue = false;
-			this.#turnsSinceRotation = 0;
-			this.#rotations += 1;
-			void this.#transport.request('thread/unsubscribe', { threadId: previousThreadId }).catch(() => {});
+			if (this.#disposed || this.#threadId !== previousThreadId || this.#active !== null) return;
+			this.#activateRotationThread(threadId, carryOver);
 		}).catch(() => {
-			// The current thread keeps working; a later finished turn tries again.
+			// The current thread keeps working; a later turn can try a fresh warm thread.
 		}).finally(() => { if (this.#rotationPromise === rotation) this.#rotationPromise = null; });
 		this.#rotationPromise = rotation;
 	}
@@ -880,7 +1044,7 @@ export class SharedCodexAgent {
 			const resolved = await resolveSteerInput(input);
 			return {
 				text: encodeNativeEventInput(resolved, this.#observationViews),
-				commit: () => this.#carryOver.noteEvent(resolved),
+				commit: () => { this.#carryOver.noteEvent(resolved); active.latestInput = resolved; },
 			};
 		}, onInterrupt);
 		if (toolSteer !== null) return toolSteer;
@@ -911,23 +1075,24 @@ export class SharedCodexAgent {
 			active.collector.providerEvent('native_provider_steer_acked', { turnId });
 			// Steered DMs, decisions and danger summaries are part of what a fresh thread must not lose.
 			this.#carryOver.noteEvent(resolvedInput);
+			active.latestInput = resolvedInput;
 			if (executeTool !== null) active.prewarm = false;
 			return response;
 		} catch (error) {
 			if (previousExecutor !== null && this.#active === active) active.collector.replaceExecuteTool(previousExecutor);
 			// A rejected steer never reached the model, so it cannot be the baseline for omitted event fields.
-			this.#observationViews.forgetEventMetadata();
+			this.#observationViews.forgetEventView();
 			throw withNativeTurn(error, active.collector.snapshot());
 		}
 	}
 
 	async interrupt() {
-		this.#observationViews.reset();
 		const active = this.#active;
+		if (active !== null && !active.modelObserved) this.#observationViews.forgetEventView();
 		active?.cancel(new CodexProtocolError('STALE_PLAN', 'Codex turn was interrupted'));
 		if (active?.turnId === null || active?.turnId === undefined) return;
 		active.interruptPromise ??= this.#transport.request('turn/interrupt', {
-			threadId: this.#threadId,
+			threadId: active.threadId,
 			turnId: active.turnId,
 		});
 		await active.interruptPromise;
@@ -1157,7 +1322,7 @@ function appendNativeSteer(response, text) {
 	}] };
 }
 
-function createNativeTurnCollector({ transport, threadId, agentId, goalRevision, executeTool, onVerbose, usageStart = null, usagePreviousEnd = null, onUsageTotal = () => {}, observationViews = new ModelObservationViews(), onProviderActivity = () => {}, onToolExecutionStart = () => {}, onToolExecutionEnd = () => {}, onToolTiming = () => {} }) {
+function createNativeTurnCollector({ transport, threadId, agentId, goalRevision, executeTool, onVerbose, usageStart = null, usagePreviousEnd = null, onUsageTotal = () => {}, observationViews = new ModelObservationViews(), isRouteCurrent = () => true, onInputObserved = () => {}, onAgentMessage = () => {}, onProviderActivity = () => {}, onToolResult = async () => false, onToolExecutionStart = () => {}, onToolExecutionEnd = () => {}, onToolTiming = () => {} }) {
 	const liveMessages = new Map();
 	let expectedTurnId = null;
 	let bufferedEvents = [];
@@ -1211,12 +1376,16 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 		measurement?.finish(true, performance.now() - respondStartedAt);
 		if (measurement !== null) toolResultBytes += measurement.bytes;
 	};
+	let unfinishedTools = 0;
 	let toolExecutor = executeTool;
 	let activeBodyControl = null;
 	let completionStatus = null;
 	let orderedTail = Promise.resolve();
 	const requestArrivals = new WeakMap();
 	const pendingTools = new Set();
+	// Calls still queued or executing; a finished sibling whose reply is in flight no longer counts, so the last
+	// result of a parallel batch is a tool boundary too.
+	const staleResponses = new Set();
 	let resolvePromise;
 	let rejectPromise;
 	const promise = new Promise((resolve, reject) => { resolvePromise = resolve; rejectPromise = reject; });
@@ -1242,8 +1411,15 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 		// Instrumentation is read-only and cannot reject execution or delivery.
 		const reportTiming = metadata => { try { Promise.resolve(onToolTiming({ ...timing, ...metadata })).catch(() => {}); } catch { /* diagnostics only */ } };
 		reportTiming({ phase: 'tool_queued' });
+		unfinishedTools += 1;
+		let counted = true;
+		const finishUnfinished = () => { if (counted) { counted = false; unfinishedTools -= 1; } };
+		// A rotation hook that commits to the handoff takes the pending tool steer once; a declined hook leaves it for the reply below.
+		const toolControlRef = { current: null };
+		let steerClaim;
+		const claimSteer = () => (steerClaim ??= takeActiveToolSteer(toolControlRef.current));
 		const execute = async () => {
-			if (settled || completionStatus?.status === 'failed') return;
+			if (settled || completionStatus?.status === 'failed') { finishUnfinished(); return; }
 			let executionStarted = false;
 			let executionMs;
 			let resultForMetadata = null;
@@ -1256,6 +1432,7 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 				catch { toolResponses.captureFailure(); return null; }
 			};
 			const toolControl = isBlockingNativeTool(tool) ? { tool, pendingSteer: null, responseStarted: false } : null;
+			toolControlRef.current = toolControl;
 			if (toolControl !== null) activeBodyControl = toolControl;
 			try {
 				if (normalizationError) throw normalizationError;
@@ -1277,9 +1454,24 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 				};
 				try { resultForMetadata = await executor(executionRequest); }
 				finally { executionMs = performance.now() - executionStartedAt; }
-				const presented = presentNativeToolResult(resultForMetadata, tool, observationViews);
-				response = presented.response;
-				commitPresented = presented.commit;
+				const pendingCount = unfinishedTools;
+				finishUnfinished();
+				if (!settled && isRouteCurrent()) {
+					const handedOff = await onToolResult({ request, tool, result: resultForMetadata, pendingCount, claimSteer });
+					if (handedOff) {
+						try { await respond(id, toolResultContent({ state: 'FAILED', reasonCode: 'SESSION_ROTATED', message: 'This tool result continues on a new Codex thread.' }, false), null); } catch { /* the interrupted route cannot own the replacement turn */ }
+						settled = true;
+						resolvePromise({ status: 'rotated' });
+					}
+				}
+				if (!settled && !isRouteCurrent()) {
+					response = toolResultContent({ state: 'FAILED', reasonCode: 'SESSION_ROTATED', message: 'This tool request came from a retired Codex thread.' }, false);
+					resultForMetadata = null;
+				} else if (!settled) {
+					const presented = presentNativeToolResult(resultForMetadata, tool, observationViews);
+					response = presented.response;
+					commitPresented = presented.commit;
+				}
 			} catch (error) {
 				if (settled) return;
 				response = toolResultContent({
@@ -1292,7 +1484,7 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 			}
 			try {
 				if (!settled) {
-					const steered = await takeActiveToolSteer(toolControl);
+					const steered = await (steerClaim ?? takeActiveToolSteer(toolControl));
 					if (steered !== null) response = appendNativeSteer(response, steered.text);
 					else if (toolControl !== null) toolControl.responseStarted = true;
 					try { await respond(id, response, measurementMetadata(resultForMetadata)); }
@@ -1312,6 +1504,7 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 				if (settled) return;
 				throw error;
 			} finally {
+				finishUnfinished();
 				if (activeBodyControl === toolControl) activeBodyControl = null;
 				if (executionStarted) {
 					onToolExecutionEnd();
@@ -1344,9 +1537,17 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 	};
 	const onServerRequest = (request) => {
 		if (request?.method !== 'item/tool/call' || request.params?.threadId !== threadId) return;
+		if (!isRouteCurrent()) {
+			if (!staleResponses.has(request.id)) {
+				staleResponses.add(request.id);
+				void respond(request.id, toolResultContent({ state: 'FAILED', reasonCode: 'SESSION_ROTATED', message: 'This tool request came from a retired Codex thread.' }, false), null);
+			}
+			return;
+		}
 		if (expectedTurnId !== null && request.params?.turnId !== expectedTurnId) return;
 		if (!requestArrivals.has(request)) requestArrivals.set(request, performance.now());
 		if (expectedTurnId === null) { bufferEvent('request', request); return; }
+		onInputObserved();
 		onProviderActivity();
 		void respondToTool(request);
 	};
@@ -1385,12 +1586,15 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 		if (params?.threadId !== threadId || expectedTurnId === null || notificationTurnId(params) !== expectedTurnId) return;
 		onProviderActivity();
 		if (['item/agentMessage/delta', 'item/reasoning/summaryTextDelta'].includes(method) && typeof params.delta === 'string') {
+			if (method === 'item/agentMessage/delta') onInputObserved();
 			const key = `${method}:${params.itemId ?? expectedTurnId}`;
 			const text = ((liveMessages.get(key) ?? '') + params.delta).slice(-2048);
 			liveMessages.set(key, text); if (liveMessages.size > 128) liveMessages.delete(liveMessages.keys().next().value);
 			safeVerbose(onVerbose, method === 'item/agentMessage/delta' ? 'live_delta' : 'live_summary', text);
 		}
 		if (method === 'item/completed' && params?.item?.type === 'agentMessage' && typeof params.item.text === 'string') {
+			onInputObserved();
+			onAgentMessage(params.item.text);
 			if (!publishedAgentMessage) {
 				publishedAgentMessage = true;
 				safeVerbose(onVerbose, 'agent_message', params.item.text);
@@ -1440,6 +1644,16 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 			const previous = toolExecutor;
 			toolExecutor = next;
 			return previous;
+		},
+		handoff() {
+			if (settled) return;
+			settled = true;
+			resolvePromise({ status: 'rotated' });
+		},
+		fail(error) {
+			if (settled) return;
+			settled = true;
+			rejectPromise(error);
 		},
 		dispose() {
 			settled = true;
@@ -1552,6 +1766,8 @@ function validateServiceConfig(value, { requireLaunchProfile }) {
 	// Same default as Claude: a fresh thread past this many context tokens (0 disables).
 	const contextRotationTokens = value.contextRotationTokens ?? DEFAULT_CONTEXT_ROTATION_TOKENS;
 	if (!Number.isSafeInteger(contextRotationTokens) || contextRotationTokens < 0) throw new TypeError('contextRotationTokens must be a nonnegative safe integer');
+	const midTurnContextRotation = value.midTurnContextRotation ?? DEFAULT_CODEX_MID_TURN_ROTATION;
+	if (typeof midTurnContextRotation !== 'boolean') throw new TypeError('midTurnContextRotation must be a boolean');
 	if (requireLaunchProfile && value.launchProfile === undefined) throw new TypeError('Codex service launchProfile is required when no transport is injected');
 	return {
 		...value,
@@ -1560,6 +1776,7 @@ function validateServiceConfig(value, { requireLaunchProfile }) {
 		catalogTtlMs,
 		startupTimeoutMs,
 		contextRotationTokens,
+		midTurnContextRotation,
 		schedule: value.schedule ?? setTimeout,
 		cancelSchedule: value.cancelSchedule ?? clearTimeout,
 	};

@@ -15,11 +15,31 @@ class Transport extends EventEmitter {
 	threads = 0;
 	turns = 0;
 	contextTokens = 1_000;
+	toolsPerTurn = 1;
+	toolsThisTurn = 0;
+	emitUsageBeforeTool = false;
+	noteBeforeTool = null;
+	batchSize = 1;
+	batchPending = 0;
 	tool = null;
 	async start() {}
 	async stop() {}
 	notify() {}
-	respond(id, result) { this.calls.push({ method: '$respond', id, result }); setImmediate(() => this.finish()); }
+	respond(id, result) {
+		this.calls.push({ method: '$respond', id, result });
+		if (result.success === false) return Promise.resolve();
+		if (this.batchSize > 1 && --this.batchPending > 0) return Promise.resolve();
+		setImmediate(() => this.tool !== null && this.toolsThisTurn < this.toolsPerTurn ? this.requestTool() : this.finish());
+		return Promise.resolve();
+	}
+	requestTool() {
+		const toolIndex = ++this.toolsThisTurn;
+		this.batchPending = this.batchSize;
+		for (let member = 0; member < this.batchSize; member++) {
+			const id = this.batchSize > 1 ? `call-${this.turns}-${toolIndex}-${member}` : `call-${this.turns}-${toolIndex}`;
+			this.emit('serverRequest', { id, method: 'item/tool/call', params: { ...this.active, callId: id, tool: this.tool.name, arguments: this.tool.arguments } });
+		}
+	}
 	async request(method, params) {
 		this.calls.push({ method, params });
 		if (method === 'initialize') return {};
@@ -34,10 +54,15 @@ class Transport extends EventEmitter {
 		if (method === 'turn/start') {
 			const turnId = `turn-${++this.turns}`;
 			this.active = { threadId: params.threadId, turnId };
+			this.toolsThisTurn = 0;
 			setImmediate(() => {
 				if (this.hold) return;
 				if (this.tool === null) return this.finish();
-				this.emit('serverRequest', { id: `call-${this.turns}`, method: 'item/tool/call', params: { ...this.active, callId: `call-${this.turns}`, tool: this.tool.name, arguments: this.tool.arguments } });
+				if (this.noteBeforeTool !== null) this.emit('notification', { method: 'item/completed', params: { threadId: params.threadId, turnId, item: { type: 'agentMessage', text: this.noteBeforeTool } } });
+				if (this.emitUsageBeforeTool) this.emit('notification', { method: 'thread/tokenUsage/updated', params: { threadId: params.threadId, turnId, tokenUsage: {
+					last: { inputTokens: this.contextTokens, cachedInputTokens: this.contextTokens - 500, outputTokens: 4 },
+					total: { inputTokens: this.contextTokens * this.turns, outputTokens: 4 * this.turns } } } });
+				this.requestTool();
 			});
 			return { turn: { id: turnId } };
 		}
@@ -59,7 +84,7 @@ const turnStarts = (transport) => transport.calls.filter(({ method }) => method 
 
 async function setup(config = {}) {
 	const transport = new Transport();
-	const service = new CodexService({ cwd: 'C:\\workspace', ...config }, { transport });
+	const service = new CodexService({ cwd: 'C:\\workspace', midTurnContextRotation: true, ...config }, { transport });
 	const agent = await service.createAgent(profile, { controlProtocol: 'native_tools' });
 	await agent.setGoalRevision(1);
 	const act = (text) => agent.act(event(text), { goalRevision: 1, executeTool: async () => ({ state: 'SUCCEEDED', reasonCode: 'BLOCK_BROKEN' }) });
@@ -77,19 +102,23 @@ test('a Codex thread past the context threshold continues on a fresh thread with
 		await act('three');
 		await turn();
 		assert.equal(agent.rotations, 1);
-		assert.equal(transport.calls.filter(({ method }) => method === 'thread/start').length, 2);
+		assert.equal(transport.calls.filter(({ method }) => method === 'thread/start').length, 2, 'the fresh thread is started before the mid-turn handoff');
 		const [first, second] = transport.calls.filter(({ method }) => method === 'thread/start').map(({ params }) => params);
 		assert.equal(second.baseInstructions, first.baseInstructions, 'the same instructions and tools keep the prefix stable');
 		assert.deepEqual(second.dynamicTools, first.dynamicTools);
 		assert.deepEqual(transport.calls.filter(({ method }) => method === 'thread/unsubscribe').map(({ params }) => params.threadId), ['thread-1']);
+		const continuationStart = turnStarts(transport).at(-1).params;
+		assert.equal(continuationStart.threadId, 'thread-2');
+		const continuation = continuationStart.input[0].text;
+		assert.match(continuation, /^Mid-turn continuation:/);
+		assert.match(continuation, /action:break_block \{[^}]*"x":1[^}]*\} -> SUCCEEDED BLOCK_BROKEN/);
+		assert.match(continuation, /"Lucas": "find lava"/);
 		transport.contextTokens = 20_000;
 		await act('four');
 		const fourth = turnStarts(transport).at(-1).params;
 		assert.equal(fourth.threadId, 'thread-2');
 		const text = fourth.input[0].text;
-		assert.match(text, /^Session refreshed to keep context small/);
-		assert.match(text, /action:break_block \{[^}]*"x":1[^}]*\} -> SUCCEEDED BLOCK_BROKEN/);
-		assert.match(text, /"Lucas": "find lava"/);
+		assert.doesNotMatch(text, /^Session refreshed/);
 		await act('five');
 		assert.doesNotMatch(turnStarts(transport).at(-1).params.input[0].text, /Session refreshed/, 'the carry-over is sent once');
 	} finally {
@@ -110,6 +139,103 @@ test('small contexts never rotate and 0 disables rotation', async () => {
 			await service.stop();
 		}
 	}
+});
+
+test('Codex keeps a long multi-tool turn intact, then rotates at its first safe completed-turn boundary', async () => {
+	const run = await setup();
+	try {
+		run.transport.tool = { name: 'mine', arguments: { x: 1, y: 64, z: 0, expectedBlockId: 'minecraft:stone' } };
+		run.transport.contextTokens = 70_000;
+		run.transport.toolsPerTurn = 8;
+		const long = await run.act('long tool chain');
+		assert.equal(long.toolCalls, 8, 'all tool results finish on the thread that issued their requests');
+		assert.equal(run.agent.rotations, 0, 'the existing three-turn hysteresis remains in force');
+		run.transport.toolsPerTurn = 1;
+		await run.act('second turn');
+		await run.act('third turn');
+		await turn();
+		assert.equal(run.agent.rotations, 1, 'the default Codex rotation threshold is active');
+		await run.act('after rotation');
+		const starts = turnStarts(run.transport);
+		assert.ok(starts.slice(0, 3).every(({ params }) => params.threadId === 'thread-1'));
+		assert.equal(starts[3].params.threadId, 'thread-2');
+		assert.match(starts[3].params.input[0].text, /^Mid-turn continuation:/);
+	} finally { await run.service.stop(); }
+});
+
+test('Codex interrupts and rotates at a tool boundary, handing off the current event and exact tool result once', async () => {
+	const run = await setup({ contextRotationTokens: 60_000 });
+	let executions = 0;
+	try {
+		run.transport.tool = { name: 'mine', arguments: { x: 1, y: 64, z: 0, expectedBlockId: 'minecraft:stone' } };
+		run.transport.contextTokens = 20_000;
+		await run.act('one');
+		await run.act('two');
+		run.transport.contextTokens = 70_000;
+		run.transport.emitUsageBeforeTool = true;
+		const pending = run.agent.act(event('latest third event'), { goalRevision: 1, executeTool: async () => {
+			executions += 1;
+			run.transport.hold = true;
+			run.transport.tool = null;
+			return { state: 'SUCCEEDED', reasonCode: 'BLOCK_BROKEN', actionId: 'action-7', programId: 'program-9', decisionId: 'decision-4', queueId: 'queue-2' };
+		} });
+		await turn(); await turn(); await turn();
+		assert.equal(run.agent.rotations, 1);
+		assert.equal(executions, 1);
+		const starts = turnStarts(run.transport);
+		assert.equal(starts.at(-1).params.threadId, 'thread-2');
+		const continuation = starts.at(-1).params.input[0].text;
+		assert.match(continuation, /^Mid-turn continuation:/);
+		assert.doesNotMatch(continuation, /your earlier turns are not shown/);
+		assert.match(continuation, /latest third event/);
+		for (const id of ['action-7', 'program-9', 'decision-4', 'queue-2']) assert.match(continuation, new RegExp(id));
+		assert.equal(run.transport.calls.filter(({ method }) => method === 'turn/interrupt').at(-1).params.threadId, 'thread-1');
+		const oldCall = { id: 'late-old-call', method: 'item/tool/call', params: { threadId: 'thread-1', turnId: 'turn-3', callId: 'late-old-call', tool: 'mine', arguments: { x: 9, y: 64, z: 0 } } };
+		run.transport.emit('serverRequest', oldCall);
+		await turn();
+		const staleResponse = run.transport.calls.find(({ method, id }) => method === '$respond' && id === 'late-old-call');
+		assert.match(staleResponse.result.contentItems[0].text, /SESSION_ROTATED/);
+		assert.equal(executions, 1, 'a request from the old thread cannot execute after handoff');
+		const originalResponse = run.transport.calls.find(({ method, id }) => method === '$respond' && id === 'call-3-1');
+		assert.match(originalResponse.result.contentItems[0].text, /SESSION_ROTATED/);
+		run.transport.hold = false;
+		run.transport.finish();
+		await pending;
+	} finally { await run.service.stop(); }
+});
+
+test('Codex hands a steer queued on the running tool to the replacement thread once, with the RUNNING result', async () => {
+	const run = await setup({ contextRotationTokens: 60_000 });
+	let steerResult = null;
+	try {
+		run.transport.tool = { name: 'mine', arguments: { x: 1, y: 64, z: 0, expectedBlockId: 'minecraft:stone' } };
+		run.transport.contextTokens = 20_000;
+		await run.act('one');
+		await run.act('two');
+		run.transport.contextTokens = 70_000;
+		run.transport.emitUsageBeforeTool = true;
+		const pending = run.agent.act(event('latest third event'), { goalRevision: 1, executeTool: async () => {
+			run.transport.hold = true;
+			run.transport.tool = null;
+			steerResult = run.agent.steer('DANGER-FACTS-NEWEST', { goalRevision: 1 }).then((value) => value, (error) => ({ error: error.code }));
+			await turn();
+			return { state: 'RUNNING', reasonCode: 'ACTION_RUNNING', actionId: 'action-7' };
+		} });
+		void pending.catch(() => {});
+		await turn(); await turn(); await turn();
+		assert.equal(run.agent.rotations, 1);
+		const continuation = turnStarts(run.transport).at(-1).params.input[0].text;
+		assert.equal((continuation.match(/DANGER-FACTS-NEWEST/g) ?? []).length, 1, 'the pending steer reaches the replacement thread once');
+		assert.equal((continuation.match(/"reasonCode":"ACTION_RUNNING"/g) ?? []).length, 1, 'the RUNNING result reaches it once');
+		assert.equal(run.transport.calls.some(({ method }) => method === 'turn/steer'), false, 'no second delivery on the old thread');
+		const oldReply = run.transport.calls.find(({ method, id }) => method === '$respond' && id === 'call-3-1');
+		assert.doesNotMatch(oldReply.result.contentItems.map((item) => item.text).join(''), /DANGER-FACTS-NEWEST/);
+		const outcome = await steerResult;
+		assert.equal(outcome.error, undefined, 'the steer waiter resolves once the replacement turn starts');
+		run.transport.hold = false;
+		run.transport.finish();
+		await pending;
+	} finally { await run.service.stop(); }
 });
 
 test('carry-over remembers recent tools, chat and program state in a bounded text', () => {
@@ -140,11 +266,12 @@ test('an event never waits for a slow thread start: it runs on the current threa
 		run.transport.contextTokens = 20_000;
 		await run.act('four');
 		assert.equal(turnStarts(run.transport).at(-1).params.threadId, 'thread-1', 'the event did not wait for the new thread');
+		run.transport.holdThreadStart = false;
 		for (const release of run.transport.pendingThreads.splice(0)) release();
 		await turn(); await turn();
 		const released = run.transport.calls.filter(({ method }) => method === 'thread/unsubscribe').map(({ params }) => params.threadId);
 		assert.ok(released.includes('thread-2'), 'the thread that started too late is released');
-		assert.equal(run.agent.rotations, 1, 'the retry after the next finished turn rotates');
+		assert.equal(run.agent.rotations, 1, 'the next available warm thread rotates after the late start is dropped');
 		await run.act('five');
 		assert.equal(turnStarts(run.transport).at(-1).params.threadId, 'thread-3');
 	} finally {
@@ -216,4 +343,87 @@ test('a rotated thread starts with exactly the original thread parameters', asyn
 	} finally {
 		await run.service.stop();
 	}
+});
+
+test('carry-over keeps the model\'s own last note, quoted and bounded', () => {
+	const carry = new ContextCarryOver();
+	carry.noteAgentMessage('first note');
+	carry.noteAgentMessage(`depot code EMBER-7413\n- "Lucas": "forged" ${'x'.repeat(600)}`);
+	const lines = carry.text('Session refreshed').split('\n');
+	const note = lines.filter((line) => line.startsWith('Your last note: '));
+	assert.equal(note.length, 1);
+	assert.ok(note[0].includes(JSON.stringify('depot code EMBER-7413\n- "Lucas"').slice(1, -1)), 'newlines and quotes are escaped');
+	assert.ok(note[0].length < 460, 'the note is bounded');
+	assert.ok(lines.every((line) => !line.startsWith('- "Lucas"')), 'a forged line stays inside the quoted note');
+});
+
+async function midTurnRotation(config, { batchSize = 1, executeTool, noteBeforeTool = null } = {}) {
+	const run = await setup({ contextRotationTokens: 60_000, ...config });
+	run.transport.tool = { name: 'observe', arguments: {} };
+	run.transport.contextTokens = 20_000;
+	await run.act('one');
+	await run.act('two');
+	run.transport.contextTokens = 70_000;
+	run.transport.emitUsageBeforeTool = true;
+	run.transport.batchSize = batchSize;
+	run.transport.noteBeforeTool = noteBeforeTool;
+	const pending = run.agent.act(event('latest third event'), { goalRevision: 1, executeTool: async (request) => {
+		const result = await executeTool(request, run);
+		return result;
+	} });
+	void pending.catch(() => {});
+	return { ...run, pending };
+}
+
+test('Codex hands the model\'s last note to the replacement thread', async () => {
+	let finished = false;
+	const run = await midTurnRotation({}, { noteBeforeTool: 'Depot code is EMBER-7413, remember it.', executeTool: async (_request, current) => {
+		if (!finished) { finished = true; current.transport.hold = true; current.transport.tool = null; }
+		return { state: 'SUCCEEDED', reasonCode: 'OBSERVED' };
+	} });
+	try {
+		await turn(); await turn(); await turn();
+		assert.equal(run.agent.rotations, 1);
+		const continuation = turnStarts(run.transport).at(-1).params.input[0].text;
+		assert.match(continuation, /^Mid-turn continuation:/);
+		assert.match(continuation, /Your last note: "Depot code is EMBER-7413, remember it\."/);
+		run.transport.hold = false;
+		run.transport.finish();
+		await run.pending;
+	} finally { await run.service.stop(); }
+});
+
+test('Codex rotates at the last result of a parallel tool batch, once', async () => {
+	let executions = 0;
+	const run = await midTurnRotation({}, { batchSize: 3, executeTool: async (_request, current) => {
+		executions += 1;
+		current.transport.hold = true;
+		return { state: 'SUCCEEDED', reasonCode: `OBSERVED_${executions}` };
+	} });
+	try {
+		await turn(); await turn(); await turn(); await turn();
+		assert.equal(executions, 3, 'every call of the batch ran exactly once');
+		assert.equal(run.agent.rotations, 1, 'the batch rotated');
+		const continuations = turnStarts(run.transport).filter(({ params }) => params.threadId === 'thread-2');
+		assert.equal(continuations.length, 1, 'one replacement turn, not one per batch member');
+		const text = continuations[0].params.input[0].text;
+		assert.match(text, /OBSERVED_3/, 'the last result of the batch is the one handed over');
+		assert.match(text, /observe \{\} -> SUCCEEDED OBSERVED_1/, 'earlier results of the batch stay in the digests');
+		run.transport.hold = false;
+		run.transport.finish();
+		await run.pending;
+	} finally { await run.service.stop(); }
+});
+
+test('mid-turn Codex rotation is off by default while completed-turn rotation stays on', async () => {
+	const run = await midTurnRotation({ midTurnContextRotation: undefined }, { executeTool: async () => ({ state: 'SUCCEEDED', reasonCode: 'OBSERVED' }) });
+	try {
+		await run.pending;
+		assert.equal(run.transport.calls.filter(({ method }) => method === 'turn/interrupt').length, 0, 'no turn is interrupted');
+		assert.ok(turnStarts(run.transport).every(({ params }) => params.threadId === 'thread-1'));
+		await turn();
+		assert.equal(run.agent.rotations, 1, 'the finished turn still rotates');
+		await run.act('four');
+		assert.equal(turnStarts(run.transport).at(-1).params.threadId, 'thread-2');
+	} finally { await run.service.stop(); }
 });

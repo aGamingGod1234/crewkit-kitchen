@@ -6,6 +6,7 @@ import path from 'node:path';
 
 import { terminateChildProcess } from './child-process-lifecycle.mjs';
 import { ClaudeToolServer } from './claude-tool-server.mjs';
+import { DEFAULT_CONTEXT_ROTATION_TOKENS } from './context-carry-over.mjs';
 import { goalSpecInstructions, nativeInstructions, nativeRecoveryInstructions, presentNativeToolResult, recoveryInstructions } from './codex-service.mjs';
 import { parseDecision } from './decision-parser.mjs';
 import { ModelObservationViews, encodeNativeEventInput } from './model-fact-encoding.mjs';
@@ -36,15 +37,20 @@ const DEFAULT_STDERR_LIMIT_BYTES = 64 * 1_024;
 const MAX_PUBLIC_AGENT_MESSAGE_CHARS = 1_280;
 // Claude Code would otherwise apply its own MCP timeout to long-running tools such as runProgram.
 const MCP_TOOL_TIMEOUT_MS = '600000';
-// Every model call re-reads the whole conversation. Past this many context tokens the next turn starts a
-// fresh Claude Code session (same system prompt and tools, so the cached prefix is reused) with a short
-// carry-over of recent actions; each event already restates the goal, task memory, facts and program state.
-const DEFAULT_CONTEXT_ROTATION_TOKENS = 64_000;
-// Hysteresis: a fresh session whose first turns already pass the threshold (large tool results) must not thrash.
+// Every model call re-reads the whole conversation. Near this threshold, warm a fresh session and hand the
+// active turn over at its next tool boundary; the same prompt and tools preserve prefix reuse.
+// Completed turns keep the existing hysteresis; a long turn can hand off after one earlier turn on the session.
 const MIN_TURNS_BETWEEN_ROTATIONS = 3;
+const STANDBY_WARMUP_LEAD_TOKENS = 10_000;
+const STANDBY_READY_TIMEOUT_MS = 250;
+const DEFAULT_MAX_CONCURRENT_STANDBYS = 2;
+const DEFAULT_STANDBY_IDLE_TIMEOUT_MS = 3_000;
 const CARRY_OVER_TOOL_CALLS = 10;
 const MAX_TRACED_TOOLS = 8;
 const CARRY_OVER_CONVERSATION = 6;
+// USD per token implied by Claude Code's own costUsd (exact fit over six traced turns); uncached input is a 0.1x-read
+// style estimate and tiny in practice. Used only for calls whose process ends before it reports a result line.
+const CALL_PRICE_USD = Object.freeze({ input: 2e-6, cacheRead: 0.2e-6, cacheWrite: 8e-6, output: 20e-6 });
 // Streamed token events renew liveness at most this often.
 const STREAM_PROGRESS_INTERVAL_MS = 1_000;
 // Claude Code builds without --include-partial-messages; recorded when one rejects the flag.
@@ -77,6 +83,7 @@ export class ClaudeProviderService {
 	#replacing = new Map();
 	#sessionGenerations = new Map();
 	#lifecycleGeneration = 0;
+	#standbyLeases = new Set();
 
 	constructor(config, dependencies = {}) {
 		this.#config = validateServiceConfig(config);
@@ -195,6 +202,12 @@ export class ClaudeProviderService {
 		await this.#dependencies.fs.chmod(systemPromptFile, 0o600).catch(() => {});
 		const agent = new ClaudeAgent(profile, {
 			...this.#dependencies,
+			acquireStandby: () => {
+				if (this.#standbyLeases.size >= this.#config.maxConcurrentStandbys) return null;
+				const lease = {};
+				this.#standbyLeases.add(lease);
+				return () => this.#standbyLeases.delete(lease);
+			},
 			config: this.#config,
 			cwd,
 			controlProtocol,
@@ -325,6 +338,13 @@ class ClaudeAgent {
 	#sessionState = 'cold';
 	#process = null;
 	#processStart = null;
+	#standbyProcess = null;
+	#standbyStart = null;
+	#standbyGeneration = 0;
+	#standbyRelease = null;
+	#standbyFailedForProcess = false;
+	#standbyIdleTimer = null;
+	#acquireStandby;
 	#route = null;
 	#sessionId = null;
 	#active = null;
@@ -350,13 +370,16 @@ class ClaudeAgent {
 	#pendingCarryOver = null;
 	#processUsed = false;
 	#processCostUsd = 0;
+	#unreportedCostUsd = 0;
 	#lastStreamProgressAt = 0;
 	#recentTools = [];
 	#recentConversation = [];
 	#lastProgram = null;
 	#lastAgentText = null;
+	#routeEpochSequence = 0;
+	#handoffPending = null;
 
-	constructor(profile, { config, cwd, controlProtocol, systemPromptFile, toolServer, spawn, terminate, fs, schedule, cancelSchedule, sessionGeneration, resetReason, onInvalidated }) {
+	constructor(profile, { config, cwd, controlProtocol, systemPromptFile, toolServer, spawn, terminate, fs, schedule, cancelSchedule, acquireStandby, sessionGeneration, resetReason, onInvalidated }) {
 		this.#profile = structuredClone(profile);
 		this.#config = config;
 		this.#cwd = cwd;
@@ -368,6 +391,7 @@ class ClaudeAgent {
 		this.#fs = fs;
 		this.#schedule = schedule;
 		this.#cancelSchedule = cancelSchedule;
+		this.#acquireStandby = acquireStandby;
 		this.#sessionGeneration = sessionGeneration;
 		this.#resetReason = resetReason;
 		this.#onInvalidated = onInvalidated;
@@ -398,7 +422,7 @@ class ClaudeAgent {
 		if (revision < this.#goalRevision) throw new ClaudeProviderError('STALE_GOAL_REVISION', `Goal revision ${revision} is older than ${this.#goalRevision}`);
 		if (revision === this.#goalRevision) return;
 		this.#goalRevision = revision;
-		if ((this.#active !== null && this.#active.goalRevision !== revision) || this.#oneShot !== null) await this.interrupt();
+		if ((this.#active !== null && this.#active.goalRevision !== revision) || this.#oneShot !== null || this.#handoffPending !== null) await this.interrupt();
 	}
 
 	/** Starts Claude Code and waits until it has discovered the Minecraft tools, without spending a model turn. */
@@ -421,6 +445,9 @@ class ClaudeAgent {
 		if (goalRevision !== this.#goalRevision) throw new ClaudeProviderError('STALE_GOAL_REVISION', `Goal revision ${String(goalRevision)} does not match ${this.#goalRevision}`);
 		if (signal?.aborted) throw signal.reason ?? new ClaudeProviderError('TURN_INTERRUPTED', 'Native tool turn was interrupted');
 		if (this.#active !== null) throw new ClaudeProviderError('TURN_IN_PROGRESS', `Claude agent '${this.agentId}' already has an active turn`);
+		this.#cancelStandbyExpiry();
+		// A standby that failed to warm during an earlier turn must not disable rotation for the rest of the process.
+		this.#standbyFailedForProcess = false;
 		await this.#ensureProcess();
 		// An interrupted turn still owes Claude Code's closing result line; never let it close this turn.
 		await this.#waitForIdle();
@@ -434,7 +461,15 @@ class ClaudeAgent {
 		const silence = createSilenceDeadline(this.#config.planningTimeoutMs, this.#schedule, this.#cancelSchedule);
 		const active = {
 			turnId: `${this.#sessionGeneration}:${++this.#turnSequence}`,
+			input,
+			latestInput: input,
 			goalRevision,
+			routeEpoch: this.#process?.routeEpoch ?? null,
+			midTurnRotationUsed: false,
+			modelSawInput: false,
+			toolDigests: [],
+			toolExecutions: 0,
+			processLost: false,
 			executeTool,
 			onVerbose,
 			onProgress,
@@ -478,15 +513,16 @@ ${encoded}`);
 			completed = true;
 			return result;
 		} catch (error) {
-			this.#observationViews.forgetEventMetadata();
+			if (!active.modelSawInput) this.#observationViews.forgetEventView();
 			if (error?.code === 'PLANNING_TIMEOUT') await this.interrupt().catch(() => {});
 			throw error;
 		} finally {
 			signal?.removeEventListener('abort', abort);
 			silence.dispose();
 			if (this.#active === active) this.#active = null;
-			// Rotate right after a finished turn, off the next event's critical path, and prewarm the new session.
 			if (completed) this.#rotateAfterTurn();
+			// A failed, interrupted or not-yet-due turn leaves any warm standby idle; it must still expire.
+			this.#scheduleStandbyExpiry();
 		}
 	}
 
@@ -582,8 +618,13 @@ ${encoded}`);
 		const oneShot = this.#oneShot;
 		if (oneShot !== null) await oneShot.cancel(new ClaudeProviderError('PLAN_CANCELLED', 'Planning was cancelled'));
 		const active = this.#active;
-		if (active === null) return;
+		if (active === null) {
+			const pending = this.#handoffPending;
+			if (pending !== null) this.#cancelHandoff(pending.active);
+			return;
+		}
 		active.reject(new ClaudeProviderError('STALE_PLAN', 'Claude turn was interrupted'));
+		this.#cancelHandoff(active);
 		if (this.#process === null) return;
 		this.#writeLine({ type: 'control_request', request_id: `interrupt-${active.turnId}`, request: { subtype: 'interrupt' } });
 		try {
@@ -599,10 +640,13 @@ ${encoded}`);
 		if (this.#disposed) return;
 		this.#disposed = true;
 		const error = this.#invalidationError ?? new ClaudeProviderError('AGENT_DISPOSED', `Claude agent '${this.agentId}' is disposed`);
+		if (this.#handoffPending !== null) this.#cancelHandoff(this.#handoffPending.active);
 		this.#active?.reject(error);
 		this.#active = null;
 		await this.#oneShot?.cancel(error);
 		await this.#stopProcess();
+		await this.#standbyStart?.catch(() => {});
+		await this.#stopStandbyProcess();
 		await this.#fs.rm(this.#systemPromptFile, { force: true }).catch(() => {});
 	}
 
@@ -624,41 +668,48 @@ ${encoded}`);
 	}
 
 	#ensureProcess() {
+		if (this.#handoffPending !== null) return this.#handoffPending.promise.then(() => this.#ensureProcess());
 		if (this.#process !== null) return Promise.resolve();
 		// prewarm() and act() can race; both must share one Claude Code process.
 		this.#processStart ??= this.#startProcess().finally(() => { this.#processStart = null; });
 		return this.#processStart;
 	}
 
-	async #startProcess() {
-		this.#resetContextState();
+	async #startProcess({ standby = false, standbyGeneration = this.#standbyGeneration } = {}) {
+		if (!standby) this.#resetContextState();
 		let resolveListed;
 		let rejectListed;
-		this.#toolsListed = { promise: new Promise((resolve, reject) => { resolveListed = resolve; rejectListed = reject; }), resolve: () => resolveListed(), reject: (error) => rejectListed(error) };
-		void this.#toolsListed.promise.catch(() => {});
-		this.#route = await this.#toolServer.register({
-			callTool: (name, args, meta) => this.#callTool(name, args, meta),
-			onToolsListed: () => this.#toolsListed?.resolve(),
+		const toolsListed = { promise: new Promise((resolve, reject) => { resolveListed = resolve; rejectListed = reject; }), resolve: () => resolveListed(), reject: (error) => rejectListed(error) };
+		void toolsListed.promise.catch(() => {});
+		const routeEpoch = ++this.#routeEpochSequence;
+		const route = await this.#toolServer.register({
+			callTool: (name, args, meta) => this.#callTool(name, args, meta, routeEpoch),
+			onToolsListed: () => toolsListed.resolve(),
 			onToolResponded: ({ toolUseId }) => {
 				if (toolUseId !== null && this.#active !== null) providerEvent(this.#active.onVerbose, 'native_provider_tool_result_sent', { callId: toolUseId });
 			},
 		});
+		if (standby && standbyGeneration !== this.#standbyGeneration) { route.unregister(); return null; }
+		const state = { child: null, stdout: '', stderr: '', stderrBytes: 0, exited: false, route, routeEpoch, toolsListed, sessionId: null, standby, retired: false };
+		if (standby) this.#standbyProcess = state;
+		else { this.#route = route; this.#toolsListed = toolsListed; }
 		this.#assertUsable();
 		const launch = buildClaudeLaunch(this.#profile, this.#config, {
 			cwd: this.#cwd,
 			systemPromptFile: this.#systemPromptFile,
-			mcpConfig: { mcpServers: { [MCP_SERVER_NAME]: { type: 'http', url: this.#route.url, headers: { Authorization: `Bearer ${this.#route.token}` } } } },
+			mcpConfig: { mcpServers: { [MCP_SERVER_NAME]: { type: 'http', url: route.url, headers: { Authorization: `Bearer ${route.token}` } } } },
 			streaming: true,
 		});
 		let child;
 		try { child = this.#spawn(launch.command, launch.args, launch.options); }
 		catch (error) {
-			this.#route.unregister();
-			this.#route = null;
+			route.unregister();
+			if (standby) this.#standbyProcess = null;
+			else this.#route = null;
 			throw new ClaudeProviderError('SPAWN_FAILED', `Could not start Claude Code: ${error.message}`, { cause: error });
 		}
-		const state = { child, stdout: '', stderr: '', stderrBytes: 0, exited: false };
-		this.#process = state;
+		state.child = child;
+		if (!standby) this.#process = state;
 		child.stdout?.setEncoding?.('utf8');
 		child.stdout?.on('data', (chunk) => this.#onStdout(state, String(chunk)));
 		child.stderr?.on('data', (chunk) => {
@@ -670,10 +721,146 @@ ${encoded}`);
 		child.once('error', (error) => this.#onProcessExit(state, new ClaudeProviderError('SPAWN_FAILED', `Could not start Claude Code: ${error.message}`, { cause: error })));
 		child.once('close', (exitCode, signalCode) => this.#onProcessExit(state, new ClaudeProviderError('PROVIDER_UNAVAILABLE',
 			`Claude Code exited with code ${String(exitCode)} and signal ${String(signalCode)} [stderr=${excerpt(state.stderr)}]`)));
+		return state;
+	}
+
+	#prepareStandbyIfUseful() {
+		const threshold = this.#config.contextRotationTokens;
+		if (threshold <= 0 || this.#lastContextTokens < Math.max(1, threshold - STANDBY_WARMUP_LEAD_TOKENS)
+			|| this.#disposed || this.#active === null || this.#active.midTurnRotationUsed || this.#standbyFailedForProcess || this.#process === null
+			|| this.#standbyProcess !== null || this.#standbyStart !== null) return;
+		const release = this.#acquireStandby?.();
+		if (typeof release !== 'function') return;
+		this.#standbyRelease = release;
+		const generation = ++this.#standbyGeneration;
+		const warming = (async () => {
+			const state = await this.#startProcess({ standby: true, standbyGeneration: generation });
+			if (state === null) throw new ClaudeProviderError('PROVIDER_UNAVAILABLE', 'Claude standby process exited during startup');
+			await withDeadline(state.toolsListed.promise, this.#config.startupTimeoutMs, this.#schedule, this.#cancelSchedule,
+				() => new ClaudeProviderError('PROVIDER_START_TIMEOUT', `Claude Code did not load the Minecraft tools within ${this.#config.startupTimeoutMs} ms`));
+			if (generation !== this.#standbyGeneration || this.#standbyProcess !== state || state.exited) throw new ClaudeProviderError('PROVIDER_UNAVAILABLE', 'Claude standby process exited during startup');
+			return state;
+		})();
+		this.#standbyStart = warming.catch(async (error) => {
+			// A standby stopped or promoted meanwhile belongs to someone else now; only the current warmup may mark failure.
+			if (generation === this.#standbyGeneration) {
+				this.#standbyFailedForProcess = true;
+				await this.#stopStandbyProcess();
+			}
+			throw error;
+		}).finally(() => { if (this.#standbyStart === tracked) this.#standbyStart = null; });
+		const tracked = this.#standbyStart;
+		void tracked.catch(() => {});
+	}
+
+	async #standbyAtToolBoundary() {
+		if (!this.#rotationDue || this.#active?.midTurnRotationUsed || this.#disposed || this.#standbyFailedForProcess) return null;
+		if (this.#standbyStart === null) return this.#standbyProcess;
+		try {
+			return await withDeadline(this.#standbyStart, STANDBY_READY_TIMEOUT_MS, this.#schedule, this.#cancelSchedule,
+				() => new ClaudeProviderError('STANDBY_READY_TIMEOUT', 'Claude standby was not ready at the next tool boundary'));
+		} catch {
+			this.#standbyFailedForProcess = true;
+			void this.#stopStandbyProcess();
+			return null;
+		}
+	}
+
+	async #stopStandbyProcess() {
+		this.#cancelStandbyExpiry();
+		const state = this.#standbyProcess;
+		this.#standbyProcess = null;
+		this.#standbyGeneration += 1;
+		this.#releaseStandbyLease();
+		if (state === null) return;
+		state.toolsListed?.reject(new ClaudeProviderError('PROVIDER_UNAVAILABLE', 'Claude standby was stopped before becoming ready'));
+		state.exited = true;
+		state.route?.unregister();
+		try { state.child?.stdin?.end?.(); } catch { /* the process may already be gone */ }
+		await Promise.resolve(this.#terminate(state.child)).catch(() => {});
+	}
+
+	#promoteStandby(state, active = null) {
+		if (this.#standbyProcess !== state || state.exited) return null;
+		this.#cancelStandbyExpiry();
+		const previous = this.#process;
+		if (this.#disposed) return null;
+		this.#standbyProcess = null;
+		this.#standbyGeneration += 1;
+		this.#releaseStandbyLease();
+		state.standby = false;
+		this.#process = state;
+		this.#route = state.route;
+		this.#toolsListed = state.toolsListed;
+		this.#sessionId = state.sessionId;
+		if (active !== null) active.routeEpoch = state.routeEpoch;
+		// Calls the old process made since its last result line are billed but will never be reported; this books them.
+		this.#resetContextState();
+		this.#rotations += 1;
+		return { previous };
+	}
+
+	#releaseStandbyLease() {
+		this.#standbyRelease?.();
+		this.#standbyRelease = null;
+	}
+
+	#scheduleStandbyExpiry() {
+		if (this.#standbyProcess === null && this.#standbyStart === null) return;
+		this.#cancelStandbyExpiry();
+		this.#standbyIdleTimer = this.#schedule(() => {
+			this.#standbyIdleTimer = null;
+			void this.#stopStandbyProcess();
+		}, this.#config.standbyIdleTimeoutMs);
+		this.#standbyIdleTimer?.unref?.();
+	}
+
+	#cancelStandbyExpiry() {
+		if (this.#standbyIdleTimer === null) return;
+		this.#cancelSchedule(this.#standbyIdleTimer);
+		this.#standbyIdleTimer = null;
+	}
+
+	/** Stops a replaced process at once: it gets no answer for its held request, or it would pay for another model call. */
+	#retireProcess(state) {
+		if (state === null) return Promise.resolve();
+		state.retired = true;
+		state.exited = true;
+		state.route?.unregister();
+		try { state.child.stdin?.end?.(); } catch { /* the process may already be gone */ }
+		return Promise.resolve(this.#terminate(state.child)).catch(() => {});
+	}
+
+	#beginHandoff(active) {
+		let resolveDone;
+		let resolveCancelled;
+		const transaction = {
+			active,
+			cancelled: false,
+			promise: new Promise((resolve) => { resolveDone = resolve; }),
+			cancelPromise: new Promise((resolve) => { resolveCancelled = resolve; }),
+			resolveDone,
+			resolveCancelled,
+		};
+		this.#handoffPending = transaction;
+		return transaction;
+	}
+
+	#finishHandoff(transaction) {
+		if (this.#handoffPending !== transaction) return;
+		this.#handoffPending = null;
+		transaction.resolveDone();
+	}
+
+	#cancelHandoff(active) {
+		const transaction = this.#handoffPending;
+		if (transaction === null || transaction.active !== active || transaction.cancelled) return;
+		transaction.cancelled = true;
+		transaction.resolveCancelled();
 	}
 
 	#onStdout(state, chunk) {
-		if (this.#process !== state) return;
+		if (this.#process !== state && this.#standbyProcess !== state) return;
 		state.stdout += chunk;
 		if (Buffer.byteLength(state.stdout, 'utf8') > this.#config.stdoutLineLimitBytes && !state.stdout.includes('\n')) {
 			this.invalidateSession(new ClaudeProviderError('OUTPUT_LIMIT_EXCEEDED', `Claude Code output line exceeded ${this.#config.stdoutLineLimitBytes} bytes`));
@@ -686,11 +873,18 @@ ${encoded}`);
 			if (line.length === 0) continue;
 			let message;
 			try { message = JSON.parse(line); } catch { continue; }
-			this.#onMessage(message);
+			this.#onMessage(message, state);
 		}
 	}
 
-	#onMessage(message) {
+	#onMessage(message, state = this.#process) {
+		if (state?.standby === true && this.#standbyProcess === state) {
+			if (message?.type === 'system' && message.subtype === 'init') {
+				if (typeof message.session_id === 'string') state.sessionId = message.session_id;
+				return;
+			}
+			return;
+		}
 		const active = this.#active;
 		const now = Date.now();
 		// Token deltas arrive many times a second; renewing timers and leases for each one is wasted work.
@@ -700,10 +894,10 @@ ${encoded}`);
 			active.silence.restart();
 			try { active.onProgress?.({ phase: 'provider' }); } catch { /* progress reporting cannot fail provider work */ }
 		}
-		if (message?.type === 'stream_event') { this.#noteStreamMarks(message.event, now); this.#onStreamEvent(message.event); return; }
-		if (message?.type === 'assistant') this.#noteAssistantUsage(message.message);
+		if (message?.type === 'stream_event') { if (active !== null) active.modelSawInput = true; this.#noteStreamMarks(message.event, now); this.#onStreamEvent(message.event); return; }
+		if (message?.type === 'assistant') { if (active !== null) active.modelSawInput = true; this.#noteAssistantUsage(message.message); }
 		if (message?.type === 'system' && message.subtype === 'init') {
-			if (typeof message.session_id === 'string') this.#sessionId = message.session_id;
+			if (typeof message.session_id === 'string') { this.#sessionId = message.session_id; if (state !== null) state.sessionId = message.session_id; }
 			if (typeof message.model === 'string' && message.model.length > 0 && message.model.length <= 256) {
 				this.#executionSettings.effective.model = message.model;
 				this.#executionSettings.evidence.model = 'provider_reported';
@@ -729,6 +923,8 @@ ${encoded}`);
 			this.#processCostUsd = message.total_cost_usd;
 			this.#usage.costUsd += delta;
 			if (active !== null) active.usage.costUsd = (active.usage.costUsd ?? 0) + delta;
+			// The reported total already covers every call made so far.
+			this.#unreportedCostUsd = 0;
 		}
 		// Per-step assistant output_tokens are placeholders; the result's usage covers this turn's real output.
 		const turnOutput = message.usage?.output_tokens;
@@ -748,49 +944,191 @@ ${encoded}`);
 			`Claude Code ended the turn (${String(message.subtype ?? 'error')}): ${excerpt(message.result ?? message.errors ?? '')}`));
 	}
 
-	async #callTool(name, args, { toolUseId }) {
+	/** Encodes a pending steer for delivery and records it as the newest event the model has been given. */
+	#steerEncoder(active) {
+		return async (input) => {
+			const text = await resolveSteerInput(input);
+			active.latestInput = text;
+			this.#noteEventFacts(text);
+			return encodeNativeEventInput(text, this.#observationViews);
+		};
+	}
+
+	/**
+	 * A rotation handoff carries the newest event as the replacement's current input, so a pending steer becomes that
+	 * input instead of a second copy. Its waiters resolve here, which is the only delivery the steer gets.
+	 */
+	async #foldPendingSteerIntoInput(active) {
+		while (active.pendingSteers !== null) {
+			const pending = active.pendingSteers;
+			let text;
+			try { text = await resolveSteerInput(pending.buildInput); }
+			catch (error) {
+				if (active.pendingSteers !== pending) { discardPendingSteer(pending); continue; }
+				active.pendingSteers = null;
+				discardPendingSteer(pending);
+				for (const waiter of pending.waiters) waiter.reject(error);
+				return;
+			}
+			if (active.pendingSteers !== pending) { discardPendingSteer(pending); continue; }
+			active.pendingSteers = null;
+			active.latestInput = text;
+			this.#noteEventFacts(text);
+			providerEvent(active.onVerbose, 'native_provider_steer_delivered', { turnId: active.turnId, steers: pending.waiters.length, waitMs: Math.max(0, Date.now() - pending.queuedAt) });
+			for (const waiter of pending.waiters) waiter.resolve();
+		}
+	}
+
+	async #callTool(name, args, { toolUseId }, routeEpoch) {
 		const active = this.#active;
 		if (this.#disposed || active === null || active.settled) {
 			return mcpContent(toolResultContent({ state: 'FAILED', reasonCode: 'TURN_NOT_ACTIVE', message: 'No Minecraft turn is active for this body.' }, false));
 		}
-		active.toolCalls += 1;
+		if (routeEpoch !== active.routeEpoch) {
+			return mcpContent(toolResultContent({ state: 'FAILED', reasonCode: 'SESSION_ROTATED', message: 'This tool request came from a retired Claude session.' }, false));
+		}
+		active.modelSawInput = true;
 		const run = async () => {
 			if (active.settled) return toolResultContent({ state: 'FAILED', reasonCode: 'TURN_NOT_ACTIVE', message: 'The Minecraft turn already ended.' }, false);
+			if (routeEpoch !== active.routeEpoch) return toolResultContent({ state: 'FAILED', reasonCode: 'SESSION_ROTATED', message: 'This tool request came from a retired Claude session.' }, false);
+			active.toolCalls += 1;
 			active.silence.pause();
 			let content;
+			let result;
+			let tool;
+			let toolFailed = false;
 			let commit = () => {};
 			try {
-				const tool = normalizeMinecraftToolCall(name, args);
-				const result = await active.executeTool({
+				tool = normalizeMinecraftToolCall(name, args);
+				active.toolExecutions += 1;
+				try { result = await active.executeTool({
 					agentId: this.agentId,
 					goalRevision: active.goalRevision,
 					threadId: this.#sessionId,
 					turnId: active.turnId,
 					callId: toolUseId,
 					tool,
-				});
-				// Same compact fact encoding and observation views Codex receives.
-				const presented = presentNativeToolResult(result, tool, this.#observationViews);
-				content = presented.response;
-				commit = presented.commit;
-				this.#rememberTool(name, args, result);
+				}); } finally { active.toolExecutions -= 1; }
+				active.toolDigests.push(this.#rememberTool(name, args, result));
 				this.#noteProgram(result);
 			} catch (error) {
-				this.#rememberTool(name, args, { state: 'FAILED', reasonCode: error?.code ?? 'TOOL_EXECUTION_FAILED' });
-				content = toolResultContent({
+				active.toolDigests.push(this.#rememberTool(name, args, { state: 'FAILED', reasonCode: error?.code ?? 'TOOL_EXECUTION_FAILED' }));
+				result = {
 					state: 'FAILED',
 					reasonCode: String(error?.code ?? 'TOOL_EXECUTION_FAILED').slice(0, 128),
 					message: String(error?.message ?? error).slice(0, 512),
 					...(error?.actionContract === undefined ? {} : { actionContract: error.actionContract }),
-				}, false);
-			} finally {
-				active.silence.resume();
+				};
+				toolFailed = true;
+			} finally { active.silence.resume(); }
+			if (active.processLost && this.#process === null && !active.settled && tool !== undefined) {
+				const transaction = this.#beginHandoff(active);
+				active.silence.pause();
+				try {
+					await this.#startProcess();
+					await withDeadline(this.#toolsListed.promise, this.#config.startupTimeoutMs, this.#schedule, this.#cancelSchedule,
+						() => new ClaudeProviderError('PROVIDER_START_TIMEOUT', `Claude Code did not load the Minecraft tools within ${this.#config.startupTimeoutMs} ms`));
+					if (active.settled || this.#active !== active || active.goalRevision !== this.#goalRevision) {
+						this.#pendingCarryOver = `${this.#carryOver('Session refreshed to continue the next turn')}\n\nCompleted tool result from the interrupted turn for "${name}":\n${JSON.stringify(result)}`;
+						return toolResultContent({ state: 'FAILED', reasonCode: 'SESSION_ROTATED', message: 'The old session ended while this tool was running.' }, false);
+					}
+					active.routeEpoch = this.#process.routeEpoch;
+					active.midTurnRotationUsed = true;
+					await this.#foldPendingSteerIntoInput(active);
+					const turnInput = encodeNativeEventInput(active.latestInput, this.#observationViews);
+					const presented = presentNativeToolResult(result, { ...tool, view: 'full' }, this.#observationViews);
+					if (toolFailed) presented.response.success = false;
+					commit = presented.commit;
+					const delivered = await deliverSteers(active, presented.response, this.#steerEncoder(active));
+					const [toolResult, ...steers] = delivered.contentItems.map((item) => item.text);
+					const handoff = [
+						this.#carryOver('Mid-turn continuation', { midTurn: true }),
+						`Current turn input to continue:\n${turnInput}`,
+						...(active.toolDigests.length === 0 ? [] : ['Completed tool calls this turn (one-line digests):', ...active.toolDigests.map((entry) => `- ${entry}`)]),
+						`Tool result for Minecraft tool "${name}"${toolUseId === null ? '' : ` (tool use ${toolUseId})`}:\n${toolResult}`,
+						...steers,
+					].filter(Boolean).join('\n\n');
+					this.#pendingCarryOver = handoff;
+					this.#writeUserMessage(handoff);
+					this.#pendingCarryOver = null;
+					this.#processUsed = true;
+					commit();
+					return toolResultContent({ state: 'FAILED', reasonCode: 'SESSION_ROTATED', message: 'The completed tool result continues in a cold replacement session.' }, false);
+				} catch (error) {
+					this.#pendingCarryOver = `${this.#carryOver('Session refreshed to continue the next turn')}\n\nCompleted tool result from the interrupted turn for "${name}":\n${JSON.stringify(result)}`;
+					active.reject(error);
+					return toolResultContent({ state: 'FAILED', reasonCode: 'SESSION_ROTATED', message: 'The completed tool result was saved for the next session.' }, false);
+				} finally {
+					active.silence.resume();
+					this.#finishHandoff(transaction);
+				}
 			}
-			const delivered = await deliverSteers(active, content, async (input) => {
-				const text = await resolveSteerInput(input);
-				this.#noteEventFacts(text);
-				return encodeNativeEventInput(text, this.#observationViews);
-			});
+			if (result !== undefined && tool !== undefined && this.#rotationDue && !active.midTurnRotationUsed && !this.#disposed) {
+				const transaction = this.#beginHandoff(active);
+				active.silence.pause();
+				try {
+					const standby = await Promise.race([
+						this.#standbyAtToolBoundary(),
+						transaction.cancelPromise.then(() => null),
+					]);
+					if (standby !== null && !transaction.cancelled && !active.settled
+						&& active.goalRevision === this.#goalRevision && this.#active === active) {
+						const promoted = await this.#promoteStandby(standby, active);
+						if (promoted !== null) {
+							const stillCurrent = !transaction.cancelled && !active.settled && this.#active === active
+								&& active.goalRevision === this.#goalRevision && !this.#disposed;
+							if (!stillCurrent) {
+							this.#pendingCarryOver = [
+								this.#carryOver('Session refreshed to continue the next turn'),
+								`Completed tool result from the interrupted turn for "${name}":\n${JSON.stringify(result)}`,
+							].join('\n\n');
+							this.#retireProcess(promoted.previous);
+							return toolResultContent({ state: 'FAILED', reasonCode: 'SESSION_ROTATED', message: 'The old turn was interrupted during session rotation.' }, false);
+						}
+						active.midTurnRotationUsed = true;
+						await this.#foldPendingSteerIntoInput(active);
+						const turnInput = encodeNativeEventInput(active.latestInput, this.#observationViews);
+						const presented = presentNativeToolResult(result, { ...tool, view: 'full' }, this.#observationViews);
+						if (toolFailed) presented.response.success = false;
+						commit = presented.commit;
+						const delivered = await deliverSteers(active, presented.response, this.#steerEncoder(active));
+						const [toolResult, ...steers] = delivered.contentItems.map((item) => item.text);
+						const handoff = [
+							this.#carryOver('Mid-turn continuation', { midTurn: true }),
+							`Current turn input to continue:\n${turnInput}`,
+							...(active.toolDigests.length === 0 ? [] : ['Completed tool calls this turn (one-line digests):', ...active.toolDigests.map((entry) => `- ${entry}`)]),
+							`Tool result for Minecraft tool "${name}"${toolUseId === null ? '' : ` (tool use ${toolUseId})`}:\n${toolResult}`,
+							...steers,
+						].filter(Boolean).join('\n\n');
+						this.#pendingCarryOver = handoff;
+						this.#writeUserMessage(handoff);
+						this.#pendingCarryOver = null;
+						this.#processUsed = true;
+						commit();
+						this.#retireProcess(promoted.previous);
+							return toolResultContent({ state: 'FAILED', reasonCode: 'SESSION_ROTATED', message: 'This process ended at a session boundary; the completed tool result continues in the replacement turn.' }, false);
+						}
+					}
+				} finally {
+					active.silence.resume();
+					this.#finishHandoff(transaction);
+				}
+			}
+			if (routeEpoch !== active.routeEpoch) {
+				this.#pendingCarryOver ??= `${this.#carryOver('Session refreshed to continue the next turn')}\n\nCompleted tool result from the interrupted turn for "${name}":\n${JSON.stringify(result)}`;
+				return toolResultContent({ state: 'FAILED', reasonCode: 'SESSION_ROTATED', message: 'This tool request came from a retired Claude session.' }, false);
+			}
+			if (active.settled && tool !== undefined) {
+				this.#pendingCarryOver ??= `${this.#carryOver('Turn interrupted after the tool completed')}\n\nCompleted tool result for "${name}":\n${JSON.stringify(result)}`;
+			}
+			if (tool === undefined) content = toolResultContent(result, false);
+			else {
+				const presented = presentNativeToolResult(result, tool, this.#observationViews);
+				if (toolFailed) presented.response.success = false;
+				content = presented.response;
+				commit = presented.commit;
+			}
+			const delivered = await deliverSteers(active, content, this.#steerEncoder(active));
 			// A settled (interrupted or aborted) turn may never show this result to the model.
 			if (!active.settled) commit();
 			this.#requestAt = Date.now();
@@ -802,24 +1140,54 @@ ${encoded}`);
 		return mcpContent(await task);
 	}
 
-	/** Starts and prewarms a fresh Claude Code session after a finished turn once the context has grown past the threshold. */
+	/** Rotates after a completed turn when a long-turn tool boundary did not use the warm session. */
 	#rotateAfterTurn() {
 		if (!this.#rotationDue || this.#turnsSinceRotation < MIN_TURNS_BETWEEN_ROTATIONS) return;
 		if (this.#process === null || this.#active !== null || this.#awaitingResult > 0 || this.#disposed) return;
-		const carryOver = this.#carryOver('Session refreshed to keep context small');
-		this.#rotations += 1;
-		void this.#stopProcess().then(() => {
-			// The previous session's views and baselines are gone with it (see #releaseProcessState).
-			this.#pendingCarryOver = carryOver;
-			if (this.#disposed || this.#invalidationError !== null) return undefined;
-			return this.#ensureProcess();
-		}).catch(() => {});
+		if (this.#standbyStart === null) { this.#rotateNow(); return; }
+		// A standby that is still starting gets a moment; one that hangs is replaced by a plain restart.
+		void withDeadline(this.#standbyStart, STANDBY_READY_TIMEOUT_MS, this.#schedule, this.#cancelSchedule,
+			() => new ClaudeProviderError('STANDBY_READY_TIMEOUT', 'Claude standby was not ready after the turn')).catch((error) => {
+			if (error?.code !== 'STANDBY_READY_TIMEOUT') return;
+			this.#standbyFailedForProcess = true;
+			void this.#stopStandbyProcess();
+		}).then(() => {
+			if (!this.#rotationDue || this.#turnsSinceRotation < MIN_TURNS_BETWEEN_ROTATIONS) return;
+			if (this.#process === null || this.#active !== null || this.#awaitingResult > 0 || this.#disposed) return;
+			this.#rotateNow();
+		});
 	}
 
-	#carryOver(reason) {
+	#rotateNow() {
+		const standby = this.#standbyProcess;
+		if (standby === null || standby.exited || this.#standbyStart !== null) {
+			// No usable standby (warmup failed, timed out or is still hanging, or the standby cap was full): restart the
+			// way a completed turn always did, so a missing standby can never switch rotation off.
+			if (standby !== null) void this.#stopStandbyProcess();
+			// The carry-over is armed before the stop so a racing turn cannot start without it.
+			this.#pendingCarryOver = this.#carryOver('Session refreshed to keep context small');
+			this.#rotations += 1;
+			void this.#stopProcess().then(() => {
+				if (this.#disposed || this.#invalidationError !== null) return undefined;
+				return this.#ensureProcess();
+			}).catch(() => {});
+			return;
+		}
+		const transaction = this.#beginHandoff(null);
+		try {
+			this.#pendingCarryOver = this.#carryOver('Session refreshed to keep context small');
+			const promoted = this.#promoteStandby(standby);
+			if (promoted !== null) void this.#retireProcess(promoted.previous);
+			else this.#pendingCarryOver = null;
+		} finally { this.#finishHandoff(transaction); }
+	}
+
+	#carryOver(reason, { midTurn = false } = {}) {
 		const lines = this.#recentTools.map((entry) => `- ${entry}`);
 		return [
-			`${reason}: your earlier turns are not shown. The event below restates your goal, task memory and facts; read taskPlan, programStatus, queryMemory or taskMemory for anything else.`,
+			midTurn
+				? `${reason}: an active tool turn resumes below. Use the completed tool result once, then continue the current goal with the latest event facts.`
+				: `${reason}: your earlier turns are not shown. The event below restates your goal, task memory and facts; read taskPlan, programStatus, queryMemory or taskMemory for anything else.`,
 			...(lines.length === 0 ? [] : ['Your most recent tool calls (oldest first):', ...lines]),
 			...(this.#recentConversation.length === 0 ? [] : ['Recent conversation already delivered to you (oldest first):', ...this.#recentConversation.map((entry) => `- ${entry}`)]),
 			...(this.#lastProgram === null ? [] : [`Last known program (verify with programStatus): ${JSON.stringify(this.#lastProgram)}`]),
@@ -857,8 +1225,16 @@ ${encoded}`);
 	#rememberTool(name, args, result) {
 		const argsText = truncate(JSON.stringify(args ?? {}), 160);
 		const outcome = [result?.state, result?.reasonCode].filter((value) => typeof value === 'string').join(' ');
-		this.#recentTools.push(`${name} ${argsText} -> ${outcome || 'returned'}`);
+		const decision = result?.decision ?? result?.status?.decision;
+		const ids = [
+			['actionId', result?.actionId], ['programId', result?.programId],
+			['decisionId', result?.decisionId ?? decision?.decisionId], ['queueId', result?.queueId],
+		].filter(([, value]) => typeof value === 'string')
+			.map(([key, value]) => `${key}=${JSON.stringify(truncate(value, 96))}`);
+		const digest = `${name} ${argsText} -> ${outcome || 'returned'}${ids.length === 0 ? '' : ` (${ids.join(', ')})`}`;
+		this.#recentTools.push(digest);
 		if (this.#recentTools.length > CARRY_OVER_TOOL_CALLS) this.#recentTools.splice(0, this.#recentTools.length - CARRY_OVER_TOOL_CALLS);
+		return digest;
 	}
 
 	/**
@@ -916,6 +1292,20 @@ ${encoded}`);
 		this.#stream = newStreamMarks();
 	}
 
+	/**
+	 * A call still streaming when its process is dropped was billed from the moment it started; the tool call that triggers
+	 * a handoff is usually dispatched before that call's message_stop. Its output so far is a lower bound.
+	 */
+	#settleOpenCalls() {
+		for (const call of this.#calls.values()) {
+			if (call.done) continue;
+			call.done = true;
+			addUsage(this.#usage, call.usage);
+			this.#unreportedCostUsd += estimateCallCostUsd(call.usage);
+			if (this.#active !== null) addUsage(this.#active.usage, call.usage);
+		}
+	}
+
 	#finishCall(call) {
 		if (call.done) return;
 		call.done = true;
@@ -928,7 +1318,9 @@ ${encoded}`);
 		this.#lastContextTokens = contextTokens;
 		const rotationTokens = this.#config.contextRotationTokens;
 		if (rotationTokens > 0 && contextTokens >= rotationTokens) this.#rotationDue = true;
+		this.#prepareStandbyIfUseful();
 		addUsage(this.#usage, call.usage);
+		this.#unreportedCostUsd += estimateCallCostUsd(call.usage);
 		const active = this.#active;
 		if (active === null) return;
 		addUsage(active.usage, call.usage);
@@ -985,11 +1377,22 @@ ${encoded}`);
 		if (state.exited) return;
 		state.exited = true;
 		if (/unknown option[^\n]*--include-partial-messages/i.test(state.stderr)) PARTIAL_MESSAGES_UNSUPPORTED.add(partialMessagesKey(this.#config));
+		if (this.#standbyProcess === state) {
+			this.#standbyProcess = null;
+			state.route?.unregister();
+			state.toolsListed?.reject(error);
+			return;
+		}
 		if (this.#process !== state) return;
 		this.#process = null;
 		// A process that dies before listing the tools fails prewarm now, not at the startup deadline.
-		this.#toolsListed?.reject(error);
+		state.toolsListed?.reject(error);
+		const activeToolCanHandoff = this.#active !== null && !this.#active.settled && this.#active.toolExecutions > 0;
 		this.#releaseProcessState();
+		if (activeToolCanHandoff) {
+			this.#active.processLost = true;
+			return;
+		}
 		if (!this.#disposed) this.invalidateSession(error);
 	}
 
@@ -1016,8 +1419,17 @@ ${encoded}`);
 
 	/** A new Claude Code process has never seen earlier events, fact views or omitted metadata. */
 	#resetContextState() {
+		this.#settleOpenCalls();
+		// A process dropped before its result line (rotation, restart, loss) still billed these calls.
+		if (this.#unreportedCostUsd > 0) {
+			this.#usage.costUsd += this.#unreportedCostUsd;
+			if (this.#active !== null) this.#active.usage.costUsd = (this.#active.usage.costUsd ?? 0) + this.#unreportedCostUsd;
+		}
+		this.#unreportedCostUsd = 0;
 		this.#observationViews.reset();
 		this.#rotationDue = false;
+		this.#lastContextTokens = 0;
+		this.#standbyFailedForProcess = false;
 		this.#turnsSinceRotation = 0;
 		this.#processUsed = false;
 		this.#processCostUsd = 0;
@@ -1307,6 +1719,7 @@ function validateServiceConfig(config) {
 	for (const effort of reasoningEfforts) {
 		if (!CLAUDE_REASONING_EFFORTS.includes(effort)) throw new TypeError(`Claude reasoning effort '${effort}' must be one of ${CLAUDE_REASONING_EFFORTS.join(', ')}`);
 	}
+	const maxConcurrentStandbys = positiveInteger(config.maxConcurrentStandbys ?? DEFAULT_MAX_CONCURRENT_STANDBYS, 'maxConcurrentStandbys');
 	return {
 		...config,
 		provider: 'claude',
@@ -1322,6 +1735,8 @@ function validateServiceConfig(config) {
 		stdoutLineLimitBytes: positiveInteger(config.stdoutLimitBytes ?? DEFAULT_STDOUT_LINE_LIMIT_BYTES, 'stdoutLimitBytes'),
 		stderrLimitBytes: positiveInteger(config.stderrLimitBytes ?? DEFAULT_STDERR_LIMIT_BYTES, 'stderrLimitBytes'),
 		contextRotationTokens: nonnegativeInteger(config.contextRotationTokens ?? DEFAULT_CONTEXT_ROTATION_TOKENS, 'contextRotationTokens'),
+		maxConcurrentStandbys,
+		standbyIdleTimeoutMs: positiveInteger(config.standbyIdleTimeoutMs ?? DEFAULT_STANDBY_IDLE_TIMEOUT_MS, 'standbyIdleTimeoutMs'),
 	};
 }
 
@@ -1406,6 +1821,10 @@ function mergeUsage(target, usage) {
 	for (const [key, field] of [['input', 'input_tokens'], ['cacheRead', 'cache_read_input_tokens'], ['cacheWrite', 'cache_creation_input_tokens'], ['output', 'output_tokens']]) {
 		if (Number.isSafeInteger(usage[field]) && usage[field] > target[key]) target[key] = usage[field];
 	}
+}
+function estimateCallCostUsd(usage) {
+	return usage.input * CALL_PRICE_USD.input + usage.cacheRead * CALL_PRICE_USD.cacheRead
+		+ usage.cacheWrite * CALL_PRICE_USD.cacheWrite + usage.output * CALL_PRICE_USD.output;
 }
 function addUsage(target, usage) {
 	target.calls += 1;

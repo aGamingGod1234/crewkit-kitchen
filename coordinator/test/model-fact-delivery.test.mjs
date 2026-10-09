@@ -234,7 +234,7 @@ test('native death input resets the view during both a new turn and active-turn 
 	assert.equal(h.transport.calls.filter(row => row.method === 'turn/steer').length, 1);
 });
 
-test('goal changes and interruption reset views while preserving the selected model and sole tool executor', async t => {
+test('goal changes preserve certain observation facts and interruption after provider activity keeps the exact view', async t => {
 	const h = await harness(t);
 	const firstTurn = await startTurn(h);
 	const initial = await observe(h, firstTurn);
@@ -242,11 +242,14 @@ test('goal changes and interruption reset views while preserving the selected mo
 	await h.agent.setGoalRevision(2);
 	const turn = await startTurn(h);
 	const changedGoal = await observe(h, turn, { view: 'changes', afterObservationId: initial.observationView.id });
-	assert.equal(changedGoal.observationView.mode, 'full');
+	assert.equal(changedGoal.observationView.mode, 'changes');
+	assert.equal(changedGoal.observationView.baseId, initial.observationView.id);
 	await h.agent.interrupt();
 	await assert.rejects(turn.promise, error => error.code === 'STALE_PLAN');
 	const nextTurn = await startTurn(h);
-	assert.equal((await observe(h, nextTurn, { view: 'changes', afterObservationId: changedGoal.observationView.id })).observationView.mode, 'full');
+	const afterInterrupt = await observe(h, nextTurn, { view: 'changes', afterObservationId: changedGoal.observationView.id });
+	assert.equal(afterInterrupt.observationView.mode, 'changes');
+	assert.equal(afterInterrupt.observationView.baseId, changedGoal.observationView.id);
 	await complete(h, nextTurn);
 	assert.ok(h.transport.calls.filter(row => row.method === 'turn/start').every(row => row.params.model === 'gpt-6.1-sol' && row.params.effort === 'medium' && row.params.serviceTier === 'fast'));
 	assert.ok(h.executed.every(tool => tool.kind === 'observe'));

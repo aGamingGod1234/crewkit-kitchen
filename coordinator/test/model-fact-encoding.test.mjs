@@ -7,6 +7,7 @@ const json = value => JSON.parse(JSON.stringify(value));
 const decoded = value => decodeModelFacts(json(encodeModelFacts(value)));
 const observation = () => ({
 	world: { worldId: 'fixture-world', dimension: 'minecraft:overworld' },
+	freshness: { fresh: true, ageMs: 10 },
 	player: { dead: false, health: 20 },
 	blocks: Array.from({ length: 32 }, (_, x) => ({ x, y: 64, z: 0, blockId: 'minecraft:stone', state: {}, bounds: [{ minX: 0, minY: 0, minZ: 0, maxX: 1, maxY: 1, maxZ: 1 }] })),
 	coverage: { blocks: { complete: false, reason: 'outside_observed_area' } },
@@ -149,6 +150,87 @@ test('native event packing retains the developer heading, retry footer and every
 	assert.equal(result.slice(lineEnd + 1), footer);
 	assert.deepEqual(decodeModelFacts(JSON.parse(result.slice(result.indexOf('\n') + 1, lineEnd))), value);
 	for (const malformed of ['plain text', 'heading\nnot JSON\nfooter', 'heading\n{}\nfooter']) assert.equal(encodeNativeEventInput(malformed), malformed);
+});
+
+test('wake deltas retain budget-trimmed observation sections instead of removing them', () => {
+	const views = new ModelObservationViews();
+	const first = views.prepare(reply(observation()), observe);
+	first.commit();
+	const event = { ...reply(observation()), contextTrimmed: { 'observation.blocks': 12_000 } };
+	delete event.observation.blocks;
+	const prepared = views.prepareEvent(event);
+	assert.equal(prepared.observationView.mode, 'changes');
+	assert.equal(prepared.observationView.remove.includes('blocks'), false);
+	assert.deepEqual(prepared.observationView.replace, {});
+	const later = views.prepareEvent({ ...reply({ ...observation(), blocks: [] }), contextTrimmed: {} });
+	assert.deepEqual(later.observationView.replace.blocks, []);
+	assert.equal(later.observationView.remove.includes('blocks'), false);
+});
+
+test('wake events send changed observation sections against the exact last event view', () => {
+	const views = new ModelObservationViews();
+	const input = (eventSequence, current) => `Wake event.\n${JSON.stringify({ event: 'observation', goalRevision: 3, eventSequence, observation: current })}`;
+	const first = decodeModelFacts(JSON.parse(encodeNativeEventInput(input(1, observation()), views).split('\n')[1]));
+	assert.equal(first.observationView.mode, 'full');
+
+	const next = observation();
+	next.player.health = 11;
+	next.blocks = next.blocks.slice(1);
+	const second = decodeModelFacts(JSON.parse(encodeNativeEventInput(input(2, next), views).split('\n')[1]));
+	const view = second.observationView;
+	assert.equal(view.mode, 'changes');
+	assert.equal(view.baseId, first.observationView.id);
+	assert.deepEqual(Object.keys(view.replace).sort(), ['blocks', 'player']);
+	const reconstructed = structuredClone(first.observation);
+	for (const section of view.remove) delete reconstructed[section];
+	Object.assign(reconstructed, view.replace);
+	assert.deepEqual(reconstructed, next);
+});
+
+test('a wake can delta against the latest exact tool observation view', () => {
+	const views = new ModelObservationViews();
+	const base = views.prepare({ ...reply(observation()), goalRevision: 3 }, observe);
+	base.commit();
+	const next = observation();
+	next.player.health = 7;
+	const input = `Wake event.\n${JSON.stringify({ event: 'observation', goalRevision: 3, observation: next })}`;
+	const delta = decodeModelFacts(JSON.parse(encodeNativeEventInput(input, views).split('\n')[1]));
+	assert.equal(delta.observationView.mode, 'changes');
+	assert.equal(delta.observationView.baseId, base.value.observationView.id);
+	assert.deepEqual(delta.observationView.replace.player, next.player);
+});
+
+test('wake event deltas fall back to full after world, dimension, death, goal or baseline resets', () => {
+	for (const [name, mutate, nextGoalRevision] of [
+		['world', value => { value.world.worldId = 'another-world'; }, 3],
+		['dimension', value => { value.world.dimension = 'minecraft:the_nether'; }, 3],
+		['death', value => { value.player.dead = true; }, 3],
+		['goal revision', value => value, 4],
+		['uncertain identity', value => { delete value.world.worldId; }, 3],
+	]) {
+		const views = new ModelObservationViews();
+		const event = (sequence, current, goalRevision = 3) => `Wake event.\n${JSON.stringify({ event: 'observation', goalRevision, eventSequence: sequence, observation: current })}`;
+		const first = decodeModelFacts(JSON.parse(encodeNativeEventInput(event(1, observation()), views).split('\n')[1]));
+		const changed = observation();
+		mutate(changed);
+		const second = decodeModelFacts(JSON.parse(encodeNativeEventInput(event(2, changed, nextGoalRevision), views).split('\n')[1]));
+		if (name === 'uncertain identity') {
+			assert.equal(second.observationView, undefined, 'an unknown world identity sends the full facts without advertising a reusable baseline');
+			assert.deepEqual(second.observation, changed);
+		} else assert.equal(second.observationView.mode, 'full', `${name} reset`);
+	}
+});
+
+test('an uncertain event delivery clears the wake baseline before the next event', () => {
+	const views = new ModelObservationViews();
+	const event = current => `Wake event.\n${JSON.stringify({ event: 'observation', goalRevision: 3, observation: current })}`;
+	const first = decodeModelFacts(JSON.parse(encodeNativeEventInput(event(observation()), views).split('\n')[1]));
+	assert.equal(first.observationView.mode, 'full');
+	views.forgetEventView();
+	const next = observation();
+	next.player.health = 4;
+	const second = decodeModelFacts(JSON.parse(encodeNativeEventInput(event(next), views).split('\n')[1]));
+	assert.equal(second.observationView.mode, 'full');
 });
 
 test('native death events invalidate the prior observation even before a dead observe reply', () => {
