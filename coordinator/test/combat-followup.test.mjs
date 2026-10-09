@@ -9,7 +9,7 @@ import { NativeProgramExecutor } from '../src/native-program-executor.mjs';
 import { NativeToolRuntime } from '../src/native-tool-runtime.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 import { validateAction } from '../src/schema.mjs';
-import { FakePlanner, eventually, start } from './fixtures/dynamic-main-fixture.mjs';
+import { FakePlanner, eventually, start, resolveNativeSteerInput } from './fixtures/dynamic-main-fixture.mjs';
 
 const ZOMBIE_A = '00000000-0000-0000-0000-0000000000a1';
 const ZOMBIE_B = '00000000-0000-0000-0000-0000000000a2';
@@ -240,14 +240,31 @@ test('trace replay: kill, then a second zombie hitting every ~1.1 s no longer st
 	const planner = new FakePlanner(registry);
 	const steers = [];
 	const traces = [];
-	planner.requestNativeTurn = async request => { planner.requests.push(request); if (planner.requests.length === 1) await gate; return { status: 'completed', toolCalls: 1 }; };
-	planner.steerNativeTurn = async request => { steers.push({ at: clock.now, input: request.input }); return { turnId: 'deciding' }; };
+	let bodyResult = null;
+	planner.requestNativeTurn = async request => {
+		planner.requests.push(request);
+		if (planner.requests.length === 1) {
+			bodyResult = await request.executeTool({ agentId: request.agentId, goalRevision: request.goalRevision,
+				turnId: 'fight-replay', callId: 'blocking-fight', tool: { kind: 'action', actionType: 'wait', arguments: { durationMs: 30_000 } } });
+			assert.equal(bodyResult.state, 'RUNNING');
+			assert.equal(bodyResult.interruptedBy, 'danger');
+			await gate;
+		}
+		return { status: 'completed', toolCalls: planner.requests.length === 1 ? 1 : 0 };
+	};
+	planner.steerNativeTurn = async request => {
+		request.onInterrupt?.();
+		steers.push({ at: clock.now, input: await resolveNativeSteerInput(request) });
+		return { turnId: 'deciding' };
+	};
 	const run = await start({ registry, planner, controlNow: () => clock.now,
 		setSteerTimeout: (callback, delay) => { const id = ++clock.id; clock.timers.set(id, { callback, due: clock.now + delay }); return id; },
 		clearSteerTimeout: id => clock.timers.delete(id),
 		traceWriter: { write(event, details) { traces.push({ event, ...details }); } },
 		config: { bridge: { port: 25570, secret: 's'.repeat(32) },
 			codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } } });
+	let actionSettled = false;
+	run.coordinator.on('actionResult', () => { actionSettled = true; });
 	const advance = async ms => {
 		clock.now += ms;
 		for (const [id, timer] of [...clock.timers]) if (timer.due <= clock.now) { clock.timers.delete(id); timer.callback(); }
@@ -261,12 +278,14 @@ test('trace replay: kill, then a second zombie hitting every ~1.1 s no longer st
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Survive the night.' } });
 		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: ++sequence, observation: wire(20) } });
 		await eventually(() => planner.requests.length === 1);
+		await eventually(() => run.bridge.sent.some(message => message.type === 'action_command'));
 		// Zombie 1 is dead; zombie 2 lands 13 hits about 1.1 s apart while the model is still deciding (trace lines 238-260).
 		let currentHealth = 20;
 		for (let hitIndex = 0; hitIndex < 13; hitIndex++) {
 			currentHealth -= 1;
 			run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: ++sequence, changedFacts: ['player.health'], observation: wire(currentHealth) } });
 			await advance(1_100);
+			if (hitIndex === 0) await eventually(() => bodyResult?.state === 'RUNNING');
 		}
 		const health = (steer) => JSON.parse(steer.input.slice(steer.input.indexOf('\n') + 1)).observation.player.health;
 		assert.ok(steers.length < 13, `per-hit steering must be coalesced (got ${steers.length})`);
@@ -287,6 +306,16 @@ test('trace replay: kill, then a second zombie hitting every ~1.1 s no longer st
 		assert.ok(folded > 0);
 		assert.equal(reported, folded, 'every folded hit is reported in a later steer summary');
 		assert.equal(health(steers.at(-1)), currentHealth - 1, 'the model always ends up with the latest health');
+		const estimateTokens = input => Math.ceil(Buffer.byteLength(input, 'utf8') / 4);
+		const queuedEveryUpdateTokens = steers.reduce((sum, steer) => sum + estimateTokens(steer.input), 0);
+		const earlyPlusNewestTokens = estimateTokens(steers[0].input) + estimateTokens(steers.at(-1).input);
+		assert.ok(earlyPlusNewestTokens < queuedEveryUpdateTokens, 'late-bound supersession needs only the first update and newest pending danger summary');
+		assert.equal(run.bridge.sent.some(message => message.type === 'action_cancel'), false, 'danger steering must not cancel the physical action');
+		const command = run.bridge.sent.find(message => message.type === 'action_command');
+		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: command.payload.actionId,
+			state: 'SUCCEEDED', reasonCode: 'WAITED', executionStarted: true, eventSequence: ++sequence } });
+		release();
+		await eventually(() => actionSettled);
 	} finally { release(); await run.coordinator.stop(); }
 });
 
@@ -298,7 +327,7 @@ test('danger and drowning attention during a deciding native turn steer it and n
 	const planner = new FakePlanner(registry);
 	const steers = [];
 	planner.requestNativeTurn = async request => { planner.requests.push(request); if (planner.requests.length === 1) await gate; return { status: 'completed', toolCalls: 1 }; };
-	planner.steerNativeTurn = async request => { steers.push({ at: clock.now, input: request.input }); return { turnId: 'deciding' }; };
+	planner.steerNativeTurn = async request => { steers.push({ at: clock.now, input: await resolveNativeSteerInput(request) }); return { turnId: 'deciding' }; };
 	const run = await start({ registry, planner, controlNow: () => clock.now,
 		setSteerTimeout: (callback, delay) => { const id = ++clock.id; clock.timers.set(id, { callback, due: clock.now + delay }); return id; },
 		clearSteerTimeout: id => clock.timers.delete(id),

@@ -404,13 +404,15 @@ export class AgentPlanner {
 		});
 	}
 
-	async steerNativeTurn({ agentId, input, goalRevision }) {
+	async steerNativeTurn({ agentId, input, goalRevision, onInterrupt = null, onDiscard = null }) {
 		const record = this.#registry.assertCurrentRevision(agentId, goalRevision);
 		if (!NATIVE_TOOL_PROVIDERS.includes(record.provider)) throw codedError('NATIVE_TOOLS_UNAVAILABLE', 'Native Minecraft tools are currently available for Codex and Claude agents only');
-		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('native steer input must be nonblank');
+		if (!(typeof input === 'function' || typeof input === 'string' && input.trim().length > 0)) throw new TypeError('native steer input must be nonblank or a builder');
+		if (onInterrupt !== null && typeof onInterrupt !== 'function') throw new TypeError('onInterrupt must be a function or null');
+		if (onDiscard !== null && typeof onDiscard !== 'function') throw new TypeError('onDiscard must be a function or null');
 		const agent = this.#codexService.getAgent(agentId);
 		if (agent === null) throw codedError('TURN_NOT_ACTIVE', `Agent '${agentId}' has no active native turn`);
-		return agent.steer(input, { goalRevision });
+		return agent.steer(input, { goalRevision, ...(onInterrupt === null ? {} : { onInterrupt }), ...(onDiscard === null ? {} : { onDiscard }) });
 	}
 
 	requestPlan({ agentId, input, prepareInput = null, goalRevision, recoverySummary = null, preserveState = false, priority = null, planningPriority = null, traceId: requestedTraceId = null, onVerbose = null }) {

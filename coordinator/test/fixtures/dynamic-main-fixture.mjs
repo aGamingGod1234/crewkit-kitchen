@@ -163,6 +163,12 @@ class FakePlanner {
 	async remove(agentId) { return this.registry.remove(agentId); }
 }
 
+async function resolveNativeSteerInput(request) {
+	const input = typeof request.input === 'function' ? await request.input() : request.input;
+	request.input = input;
+	return input;
+}
+
 class RecordingGoalSupervisor {
 	activations = [];
 	terminations = [];
@@ -298,4 +304,4 @@ class NativeLifecycleClock {
 	dependencies() { return { goalClock: () => this.now, goalSchedule: this.schedule, cancelGoalSchedule: this.cancel, goalStuckSchedule: this.schedule, cancelGoalStuckSchedule: this.cancel }; }
 }
 
-export { testPollTimeout, SOURCE, createDynamicCoordinator, FakeBridge, DeferredCompletionBridge, GatedActionCancelBridge, GatedAgentReadyBridge, ThrowingPlanningRegistry, FakeProvider, FakePlanner, RecordingGoalSupervisor, record, factToWireObservation, DEATH, pickProfile, immutableGoalSpec, eventually, ManualTimerQueue, start, realPlannerProvider, NativeLifecycleClock };
+export { testPollTimeout, SOURCE, createDynamicCoordinator, FakeBridge, DeferredCompletionBridge, GatedActionCancelBridge, GatedAgentReadyBridge, ThrowingPlanningRegistry, FakeProvider, FakePlanner, RecordingGoalSupervisor, record, factToWireObservation, DEATH, pickProfile, immutableGoalSpec, eventually, ManualTimerQueue, start, realPlannerProvider, NativeLifecycleClock, resolveNativeSteerInput };

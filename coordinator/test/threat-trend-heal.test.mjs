@@ -6,7 +6,7 @@ import { DangerSteerCoalescer } from '../src/danger-steer-coalescer.mjs';
 import { NO_TASK_HEAL_INSTRUCTION, TASK_HEAL_INSTRUCTION, buildNativeEventInput, classifyObservationTrigger, healNudgeVerdict, healWakeVerdict,
 	healingFacts, threatOutlook } from '../src/dynamic-main.mjs';
 import { threatFacts } from '../src/observation-adapter.mjs';
-import { FakeBridge, FakePlanner, immutableGoalSpec, eventually, start } from './fixtures/dynamic-main-fixture.mjs';
+import { FakeBridge, FakePlanner, immutableGoalSpec, eventually, start, resolveNativeSteerInput } from './fixtures/dynamic-main-fixture.mjs';
 
 // Play-test 2026-10-08 (play-session-3-trace.jsonl). Sonnet, with no task, was targeted by a creeper. The first threat
 // edge said risk 4 at 16 blocks; risk only reached 100-200 at about 3 blocks, and the model's first move came then
@@ -137,7 +137,7 @@ test('heal nudge: walking past animals and crops does not repeat it; carried foo
 function scriptedPlanner(registry) {
 	const planner = new FakePlanner(registry);
 	planner.outcomes = [];
-	planner.steerNativeTurn = async (request) => { planner.steers = [...(planner.steers ?? []), request]; };
+	planner.steerNativeTurn = async (request) => { await resolveNativeSteerInput(request); planner.steers = [...(planner.steers ?? []), request]; };
 	planner.requestNativeTurn = async (request) => {
 		planner.requests.push(request);
 		if (planner.requests.length === 1) {
@@ -192,8 +192,9 @@ test('heal nudge with a task steers the deciding turn once, with the food option
 	const all = [];
 	// Health drops are damage steers of their own; only the heal nudges are counted in steers.
 	planner.steerNativeTurn = async (request) => {
-		all.push(request.input);
-		if (request.input.startsWith(TASK_HEAL_INSTRUCTION)) steers.push(request.input);
+		const input = await resolveNativeSteerInput(request);
+		all.push(input);
+		if (input.startsWith(TASK_HEAL_INSTRUCTION)) steers.push(input);
 		return { turnId: 'deciding' };
 	};
 	const run = await start({ registry, planner, config: NATIVE_CONFIG, traceWriter: { write(event, details) { traces.push({ event, ...details }); } } });
@@ -235,7 +236,7 @@ test('heal nudge never replaces another named trigger; it follows on the next pl
 	const steers = [];
 	const traces = [];
 	planner.requestNativeTurn = async (request) => { planner.requests.push(request); if (planner.requests.length === 1) await gate; return { status: 'completed', toolCalls: 1 }; };
-	planner.steerNativeTurn = async (request) => { steers.push(JSON.parse(request.input.slice(request.input.indexOf('\n') + 1)).trigger); return { turnId: 'deciding' }; };
+	planner.steerNativeTurn = async (request) => { const input = await resolveNativeSteerInput(request); steers.push(JSON.parse(input.slice(input.indexOf('\n') + 1)).trigger); return { turnId: 'deciding' }; };
 	const run = await start({ registry, planner, config: NATIVE_CONFIG, traceWriter: { write(event, details) { traces.push({ event, ...details }); } } });
 	let sequence = 0;
 	const beef = [{ stableId: BEEF, itemId: 'minecraft:beef', count: 1, x: 2, y: 64, z: 0 }];

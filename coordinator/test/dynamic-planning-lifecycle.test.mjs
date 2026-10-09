@@ -6,7 +6,7 @@ import { AgentPlanner } from '../src/agent-planner.mjs';
 import { PlanningScheduler } from '../src/planning-scheduler.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 import { withCompletionContract } from './fixtures/completion-contract.mjs';
-import { SOURCE, createDynamicCoordinator, FakeBridge, GatedActionCancelBridge, FakeProvider, FakePlanner, record, factToWireObservation, DEATH, immutableGoalSpec, eventually, start, realPlannerProvider } from './fixtures/dynamic-main-fixture.mjs';
+import { SOURCE, createDynamicCoordinator, FakeBridge, GatedActionCancelBridge, FakeProvider, FakePlanner, record, factToWireObservation, DEATH, immutableGoalSpec, eventually, start, realPlannerProvider, resolveNativeSteerInput } from './fixtures/dynamic-main-fixture.mjs';
 
 for (const steerOutcome of ['resolved', 'rejected']) {
 test(`queued native steering cannot cross a same-revision death lifecycle (${steerOutcome})`, async () => {
@@ -26,8 +26,14 @@ test(`queued native steering cannot cross a same-revision death lifecycle (${ste
 		return { status: 'completed', toolCalls: 0 };
 	};
 	planner.steerNativeTurn = async request => {
+		if (steers.length === 0) {
+			steers.push(request);
+			await steerGate;
+			await resolveNativeSteerInput(request);
+			return;
+		}
+		await resolveNativeSteerInput(request);
 		steers.push(request);
-		if (steers.length === 1) await steerGate;
 	};
 	const run = await start({ registry, planner, traceWriter: { write(event) { traceEvents.push(event); } }, config: {
 		bridge: { port: 25570, secret: 's'.repeat(32) },
@@ -79,8 +85,14 @@ test('reconnect replays unacknowledged steering before replacement delivery and 
 		return { status: 'completed', toolCalls: 1 };
 	};
 	planner.steerNativeTurn = async request => {
+		if (steers.length === 0) {
+			steers.push(request);
+			await steerGate;
+			await resolveNativeSteerInput(request);
+			return;
+		}
+		await resolveNativeSteerInput(request);
 		steers.push(request);
-		if (steers.length === 1) await steerGate;
 	};
 	const run = await start({ registry, planner, config: {
 		bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' },
@@ -111,7 +123,7 @@ test('reconnect replays unacknowledged steering before replacement delivery and 
 		rejectSteer(Object.assign(new Error('old turn ended'), { code: 'TURN_NOT_ACTIVE' }));
 		for (let index = 0; index < 5; index++) await new Promise(resolve => setImmediate(resolve));
 		say(2);
-		await eventually(() => steers.length === 2);
+		await eventually(() => steers.length === 2 && typeof steers[1].input === 'string');
 		assert.match(steers[1].input, /Reconnect instruction 2\./);
 		assert.doesNotMatch(steers[1].input, /Reconnect instruction 1\./, 'late failure must not rewind replacement delivery');
 	} finally {
@@ -475,7 +487,7 @@ test('zero-tool native conversation retries visibly under the replacement work e
 		} });
 		await deferredSteering;
 		assert.equal(steers.length, 1);
-		assert.match(steers[0].input, /Reply in the replacement session/);
+		assert.equal(typeof steers[0].input, 'function', 'a rejected steer builder has not reserved the conversation');
 		releaseReplacementTurn();
 		await eventually(() => planner.requests.length === 4);
 		assert.match(planner.requests[2].input, /Reply in the replacement session/);

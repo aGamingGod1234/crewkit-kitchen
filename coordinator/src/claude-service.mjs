@@ -442,7 +442,7 @@ class ClaudeAgent {
 			toolCalls: 0,
 			usage: { calls: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0, costUsd: null },
 			publishedMessage: false,
-			pendingSteers: [],
+			pendingSteers: null,
 			tail: Promise.resolve(),
 			settled: false,
 			resolve: (value) => { if (!active.settled) { active.settled = true; failPendingSteers(active); resolveTurn(value); } },
@@ -490,22 +490,33 @@ ${encoded}`);
 		}
 	}
 
-	async steer(input, { goalRevision = this.#goalRevision } = {}) {
+	async steer(input, { goalRevision = this.#goalRevision, onInterrupt = null, onDiscard = null } = {}) {
 		this.#assertNative('steer');
 		this.#assertUsable();
-		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('native steer input must be nonblank');
+		if (!(typeof input === 'function' || typeof input === 'string' && input.trim().length > 0)) throw new TypeError('native steer input must be nonblank or a builder');
+		if (onInterrupt !== null && typeof onInterrupt !== 'function') throw new TypeError('onInterrupt must be a function or null');
+		if (onDiscard !== null && typeof onDiscard !== 'function') throw new TypeError('onDiscard must be a function or null');
 		if (goalRevision !== this.#goalRevision) throw new ClaudeProviderError('STALE_GOAL_REVISION', `Goal revision ${goalRevision} does not match ${this.#goalRevision}`);
 		const active = this.#active;
 		if (active === null || active.settled || active.goalRevision !== goalRevision) {
 			throw new ClaudeProviderError('TURN_NOT_ACTIVE', `Claude agent '${this.agentId}' has no steerable native turn`);
 		}
 		// Claude Code's own mid-turn message queue can spill into a second turn, which would desynchronize
-		// turn accounting. Steers therefore ride along with the next tool result; if the turn ends first the
-		// rejection makes the coordinator defer the event to the next turn.
-		return new Promise((resolve, reject) => {
-			active.pendingSteers.push({ text: input, queuedAt: Date.now(), resolve: () => resolve({ turnId: active.turnId }), reject });
+		// turn accounting. Keep only the newest pending builder and resolve every folded request from that delivery.
+		const delivered = new Promise((resolve, reject) => {
+			const waiter = { resolve: () => resolve({ turnId: active.turnId }), reject };
+			const previous = active.pendingSteers;
+			active.pendingSteers = {
+				buildInput: typeof input === 'function' ? input : async () => input,
+				onDiscard, discarded: false,
+				waiters: [...(previous?.waiters ?? []), waiter],
+				queuedAt: previous?.queuedAt ?? Date.now(),
+			};
+			discardPendingSteer(previous);
 			active.silence.restart();
 		});
+		try { onInterrupt?.(); } catch { /* steer delivery remains authoritative if interruption reporting fails */ }
+		return delivered;
 	}
 
 	/** One-shot structured decision used for goal translation and ArenaScript planning. */
@@ -775,7 +786,8 @@ ${encoded}`);
 			} finally {
 				active.silence.resume();
 			}
-			const delivered = deliverSteers(active, content, (text) => {
+			const delivered = await deliverSteers(active, content, async (input) => {
+				const text = await resolveSteerInput(input);
 				this.#noteEventFacts(text);
 				return encodeNativeEventInput(text, this.#observationViews);
 			});
@@ -1193,19 +1205,47 @@ function resultErrorCode(document) {
 }
 
 /** Appends queued steers to a tool result so the model sees them before its next decision. */
-function deliverSteers(active, content, encode = (text) => text) {
-	const steers = active.pendingSteers.splice(0);
-	if (steers.length === 0) return content;
-	providerEvent(active.onVerbose, 'native_provider_steer_delivered', { turnId: active.turnId, steers: steers.length, waitMs: Math.max(0, Date.now() - Math.min(...steers.map((steer) => steer.queuedAt))) });
-	const text = `Newer coordinator events for this turn (treat them exactly like the turn input):\n${steers.map((steer) => encode(steer.text)).join('\n\n')}`;
-	for (const steer of steers) steer.resolve();
-	return { ...content, contentItems: [...content.contentItems, { type: 'inputText', text }] };
+async function deliverSteers(active, content, encode = (text) => text) {
+	while (active.pendingSteers !== null) {
+		const pending = active.pendingSteers;
+		let text;
+		try { text = await encode(await pending.buildInput()); }
+		catch (error) {
+			if (active.pendingSteers !== pending) { discardPendingSteer(pending); continue; }
+			active.pendingSteers = null;
+			discardPendingSteer(pending);
+			for (const waiter of pending.waiters) waiter.reject(error);
+			return content;
+		}
+		if (active.pendingSteers !== pending) { discardPendingSteer(pending); continue; }
+		active.pendingSteers = null;
+		providerEvent(active.onVerbose, 'native_provider_steer_delivered', { turnId: active.turnId, steers: pending.waiters.length, waitMs: Math.max(0, Date.now() - pending.queuedAt) });
+		const delivered = { ...content, contentItems: [...content.contentItems, {
+			type: 'inputText', text: `Newer coordinator events for this turn (treat them exactly like the turn input):\n${text}`,
+		}] };
+		for (const waiter of pending.waiters) waiter.resolve();
+		return delivered;
+	}
+	return content;
 }
 
 function failPendingSteers(active) {
-	for (const steer of active.pendingSteers.splice(0)) {
-		steer.reject(new ClaudeProviderError('TURN_NOT_ACTIVE', 'Claude turn ended before the steer reached a tool boundary'));
-	}
+	const pending = active.pendingSteers;
+	active.pendingSteers = null;
+	discardPendingSteer(pending);
+	for (const waiter of pending?.waiters ?? []) waiter.reject(new ClaudeProviderError('TURN_NOT_ACTIVE', 'Claude turn ended before the steer reached a tool boundary'));
+}
+
+function discardPendingSteer(pending) {
+	if (pending === null || pending === undefined || pending.discarded) return;
+	pending.discarded = true;
+	try { pending.onDiscard?.(); } catch { /* cleanup reporting cannot interrupt the next steer */ }
+}
+
+async function resolveSteerInput(input) {
+	const resolved = typeof input === 'function' ? await input() : input;
+	if (typeof resolved !== 'string' || resolved.trim().length === 0) throw new TypeError('native steer builder must return nonblank text');
+	return resolved;
 }
 
 function mcpContent({ success, contentItems }) {

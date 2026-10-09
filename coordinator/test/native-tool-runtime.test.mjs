@@ -149,6 +149,138 @@ test('native body dispatches one correlated action and resolves only its matchin
 	assert.deepEqual(await result, { state: 'SUCCEEDED', reasonCode: '', executionStarted: true });
 });
 
+test('urgent interruption returns a running action without cancelling its body command', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
+	const pending = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-interrupt', callId: 'call-interrupt',
+		tool: { kind: 'action', actionType: 'navigate_to', arguments: { x: 20, y: 64, z: 20, timeoutMs: 30_000 } },
+	}, record());
+	for (let attempt = 0; attempt < 8 && sent.length === 0; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(sent.length, 1, 'the body command starts before its interrupt is delivered');
+	const actionId = sent[0][2].actionId;
+	assert.equal(runtime.interruptBlockingTool?.('agent-a', 'danger'), true);
+	const early = await Promise.race([
+		pending,
+		new Promise((resolve) => setTimeout(() => resolve({ state: 'STILL_BLOCKED' }), 50)),
+	]);
+	assert.deepEqual(early, {
+		actionId, goalRevision: 3, actionType: 'navigate_to', state: 'RUNNING', interruptedBy: 'danger',
+		recoveryHint: `replaceAction with actionId ${actionId} and your authored fight_target/flee_from switches now; cancelAction with the same actionId stops it.`,
+	});
+	assert.deepEqual(sent.map(([type]) => type), ['action_command'], 'steering does not cancel the physical action');
+	await assert.rejects(runtime.execute(nativeCall({ kind: 'action', actionType: 'wait', arguments: { durationMs: 1 } }), record()), (error) => {
+		assert.equal(error.code, 'NATIVE_ACTION_IN_PROGRESS');
+		assert.match(error.message, new RegExp(actionId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+		assert.match(error.message, /replaceAction/);
+		assert.match(error.message, /cancelAction/);
+		return true;
+	});
+	assert.equal(runtime.onActionResult(record(), { actionId, goalRevision: 3, state: 'SUCCEEDED', reasonCode: 'DONE' }), true);
+});
+
+test('say uses its own communication slot while the body action keeps running', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
+	const body = runtime.execute(nativeCall({ kind: 'action', actionType: 'navigate_to', arguments: { x: 20, y: 64, z: 20, timeoutMs: 30_000 } }), record());
+	for (let attempt = 0; attempt < 8 && sent.length === 0; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	const bodyId = sent[0][2].actionId;
+	const say = runtime.execute(nativeCall({ kind: 'action', actionType: 'chat', arguments: { message: 'I am answering while I continue.', audience: 'direct', recipientId: 'player-a' } }, { callId: 'call-say' }), record());
+	for (let attempt = 0; attempt < 8 && sent.length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(sent.map(([type]) => type), ['action_command', 'action_command']);
+	assert.equal(sent[1][2].actionType, 'chat');
+	const sayId = sent[1][2].actionId;
+	assert.equal(runtime.onActionResult(record(), { actionId: sayId, goalRevision: 3, state: 'SUCCEEDED', reasonCode: 'CHAT_SENT' }), true);
+	assert.equal((await say).state, 'SUCCEEDED');
+	assert.equal((await runtime.execute(nativeCall({ kind: 'action_status', actionId: bodyId }), record())).state, 'RUNNING');
+	assert.equal(runtime.onActionResult(record(), { actionId: bodyId, goalRevision: 3, state: 'SUCCEEDED', reasonCode: 'ARRIVED' }), true);
+	assert.equal((await body).state, 'SUCCEEDED');
+});
+
+test('disposeAll cancels a communication-only action during coordinator shutdown', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
+	const say = runtime.execute(nativeCall({ kind: 'action', actionType: 'chat', arguments: { message: 'One moment.', audience: 'direct', recipientId: 'player-a' } }), record());
+	for (let attempt = 0; attempt < 8 && sent.length === 0; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	const sayId = sent[0][2].actionId;
+	await runtime.disposeAll('coordinator_stopped');
+	const outcome = await Promise.race([
+		say.then(() => ({ state: 'resolved' }), (error) => ({ state: 'rejected', code: error.code })),
+		new Promise((resolve) => setTimeout(() => resolve({ state: 'STUCK' }), 50)),
+	]);
+	assert.deepEqual(outcome, { state: 'rejected', code: 'NATIVE_ACTION_CANCELLED' });
+	assert.deepEqual(sent.map(([type, _agentId, payload]) => [type, payload.actionId]), [
+		['action_command', sayId], ['action_cancel', sayId],
+	]);
+});
+
+test('a danger-authored fight action replaces the exact interrupted body action', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
+	const body = runtime.execute(nativeCall({ kind: 'action', actionType: 'navigate_to', arguments: { x: 20, y: 64, z: 20, timeoutMs: 30_000 } }), record());
+	for (let attempt = 0; attempt < 8 && sent.length === 0; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	const originalId = sent[0][2].actionId;
+	runtime.interruptBlockingTool('agent-a', 'danger');
+	assert.equal((await body).actionId, originalId);
+	const defense = runtime.execute(nativeCall({ kind: 'action', actionType: 'fight_target', arguments: { targetId: 'mob-uuid', timeoutMs: 15_000 } }, { callId: 'call-defense' }), record());
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(sent.map(([type]) => type), ['action_command', 'action_cancel']);
+	assert.deepEqual(sent[1][2], { actionId: originalId, goalRevision: 3 });
+	assert.equal(runtime.onActionResult(record(), { actionId: originalId, goalRevision: 3, state: 'CANCELLED', reasonCode: 'ACTION_CANCELLED' }), true);
+	for (let attempt = 0; attempt < 8 && sent.length < 3; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(sent[2][2].actionType, 'fight_target');
+	assert.equal(sent[2][2].provenance.sourceStepId, 'call-defense');
+	assert.equal(runtime.onActionResult(record(), { actionId: sent[2][2].actionId, goalRevision: 3, state: 'SUCCEEDED', reasonCode: 'TARGET_KILLED' }), true);
+	assert.equal((await defense).state, 'SUCCEEDED');
+});
+
+test('replace_action can return early while its exact cancellation is still awaiting acknowledgement', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
+	const handle = await runtime.execute(nativeCall({ kind: 'start_action', actionType: 'wait', arguments: { durationMs: 30_000 } }), record());
+	const replacement = runtime.execute(nativeCall({ kind: 'replace_action', actionId: handle.actionId, goalRevision: 3, actionType: 'wait', arguments: { durationMs: 1 } }), record());
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(sent.map(([type]) => type), ['action_command', 'action_cancel']);
+	assert.equal(runtime.interruptBlockingTool('agent-a'), true);
+	const early = await Promise.race([replacement, new Promise((resolve) => setTimeout(() => resolve({ state: 'STILL_BLOCKED' }), 50))]);
+	assert.equal(early.state, 'CANCELLING');
+	assert.equal(early.actionId, handle.actionId);
+	assert.equal(early.interruptedBy, 'danger');
+	assert.match(early.recoveryHint, /cancellation.*requested/i);
+	assert.equal(sent.filter(([type]) => type === 'action_command').length, 1, 'replacement waits for the exact cancellation receipt');
+	assert.equal(runtime.onActionResult(record(), { actionId: handle.actionId, goalRevision: 3, state: 'CANCELLED', reasonCode: 'ACTION_CANCELLED' }), true);
+});
+
+test('an interrupted sequence reports its active step and leaves later actions unstarted', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
+	const pending = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-sequence-interrupt', callId: 'call-sequence-interrupt',
+		tool: { kind: 'sequence', actions: [
+			{ actionType: 'navigate_to', arguments: { x: 8, y: 64, z: 8, timeoutMs: 30_000 } },
+			{ actionType: 'wait', arguments: { durationMs: 1_000 } },
+		] },
+	}, record());
+	for (let attempt = 0; attempt < 8 && sent.length === 0; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(sent.length, 1, 'only the current sequence step has started');
+	const actionId = sent[0][2].actionId;
+	assert.equal(runtime.interruptBlockingTool('agent-a'), true);
+	const early = await Promise.race([
+		pending,
+		new Promise((resolve) => setTimeout(() => resolve({ state: 'STILL_BLOCKED' }), 50)),
+	]);
+	assert.equal(early.state, 'RUNNING');
+	assert.equal(early.actionId, actionId);
+	assert.equal(early.actionType, 'navigate_to');
+	assert.equal(early.interruptedBy, 'danger');
+	assert.deepEqual(early.sequence, { runningStep: 1, completedSteps: 0, remainingSteps: 1 });
+	assert.match(early.recoveryHint, /Later steps were not started/);
+	assert.deepEqual(sent.map(([type]) => type), ['action_command']);
+	assert.equal(runtime.onActionResult(record(), { actionId, goalRevision: 3, state: 'SUCCEEDED', reasonCode: 'DONE' }), true);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(sent.map(([type]) => type), ['action_command'], 'the sequence remainder requires a new model-authored call');
+});
+
 test('native action results do not attach stale recovery without a fresh observation', async () => {
 	const sent = [];
 	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });

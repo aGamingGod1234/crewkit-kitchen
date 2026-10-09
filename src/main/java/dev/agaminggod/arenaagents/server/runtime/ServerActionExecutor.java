@@ -300,6 +300,32 @@ public final class ServerActionExecutor {
 		}
 	}
 
+	/** Delivers say while a physical action owns the per-agent body slot, without replacing or waiting on it. */
+	public synchronized void submitConcurrentChat(ServerActionRequest request) {
+		Objects.requireNonNull(request, "request must not be null");
+		if (request.traceId() == null || request.provenance().traceId() == null) {
+			throw new AgentDomainException("MISSING_TRACE_ID", "Model-authored chat requires a non-null trace ID");
+		}
+		if (request.type() != ActionType.CHAT) {
+			throw new AgentDomainException("INVALID_CONCURRENT_CHAT", "Only chat may bypass a physical action's body slot");
+		}
+		String quarantineReason = quarantinedAgents.get(request.agentId());
+		if (quarantineReason != null) throw new AgentDomainException("ACTION_RUNTIME_QUARANTINED", quarantineReason);
+		long startedAt = System.currentTimeMillis();
+		try {
+			manager.findAgentPlayer(request.agentId()).orElseThrow(
+					() -> new AgentDomainException("AGENT_PLAYER_MISSING", "Agent player is not loaded")
+			);
+			sendConversation(request, request.arguments());
+			emit(request, ServerActionState.SUCCEEDED, "ACTION_COMPLETED", "Action completed",
+					System.currentTimeMillis() - startedAt, true, false);
+		} catch (RuntimeException exception) {
+			String reason = exception instanceof AgentDomainException domain ? domain.code() : "ACTION_REJECTED";
+			emit(request, ServerActionState.FAILED, reason, safeMessage(exception),
+					System.currentTimeMillis() - startedAt, true, false);
+		}
+	}
+
 	public static boolean isArenaScriptPrimitive(ActionType type) {
 		return ARENA_SCRIPT_PRIMITIVES.contains(Objects.requireNonNull(type, "type must not be null"));
 	}

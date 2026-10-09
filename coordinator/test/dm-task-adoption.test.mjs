@@ -4,7 +4,7 @@ import { AgentRegistry, DynamicAgentState } from '../src/agent-registry.mjs';
 import { normalizeMinecraftToolCall, NATIVE_AGENT_INSTRUCTIONS, MINECRAFT_DYNAMIC_TOOLS } from '../src/native-minecraft-tools.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 import { AWAITING_CONFIRMATION_EVENT_INSTRUCTION } from '../src/dynamic-main.mjs';
-import { DeferredCompletionBridge, FakePlanner, record, immutableGoalSpec, eventually, start } from './fixtures/dynamic-main-fixture.mjs';
+import { DeferredCompletionBridge, FakePlanner, record, immutableGoalSpec, eventually, start, resolveNativeSteerInput } from './fixtures/dynamic-main-fixture.mjs';
 
 // A player's DM to an agent with no active task: the model decides whether it is a request,
 // adopts it with takeTask, and Minecraft decides whether the goal may start.
@@ -33,7 +33,7 @@ function scriptedPlanner(registry, turns) {
 	const planner = new FakePlanner(registry);
 	planner.outcomes = [];
 	planner.steers = [];
-	planner.steerNativeTurn = async ({ input }) => { planner.steers.push(input); };
+	planner.steerNativeTurn = async (request) => { planner.steers.push(await resolveNativeSteerInput(request)); };
 	planner.requestNativeTurn = async (request) => {
 		planner.requests.push(request);
 		const turn = planner.requests.length;
