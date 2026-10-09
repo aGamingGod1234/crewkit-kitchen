@@ -223,6 +223,50 @@ test('cancelling a direct flee taken during the pause leaves the paused program 
 	assert.ok(status.decision.decisionId);
 });
 
+async function interruptedPausedFight(h) {
+	const handle = await pausedByDamage(h);
+	const first = h.call('act', { actionType: 'fight_target', arguments: { targetId: ZOMBIE_B, timeoutMs: 15_000 } });
+	await tick();
+	assert.equal(h.runtime.interruptBlockingTool(record.agentId), true);
+	const interrupted = await first;
+	assert.equal(interrupted.interruptedBy, 'danger');
+	assert.equal((await h.call('programStatus')).engineState, 'SUSPENDED');
+	return { handle, interrupted };
+}
+
+test('a second fight_target replaces the danger-interrupted fight of a paused program', async t => {
+	const h = runtimeHarness(t);
+	const { interrupted } = await interruptedPausedFight(h);
+	const second = h.call('act', { actionType: 'fight_target', arguments: { targetId: ZOMBIE_B, timeoutMs: 15_000 } });
+	await tick();
+	const cancels = h.sent.filter(entry => entry.type === 'action_cancel' && entry.payload.actionId === interrupted.actionId);
+	assert.equal(cancels.length, 1, 'the exact interrupted fight is cancelled');
+	h.finish({ payload: { actionId: interrupted.actionId } }, 'CANCELLED');
+	await tick();
+	assert.equal(h.commands().length, 3, 'the replacement fight dispatches after the cancel receipt');
+	assert.equal(h.commands()[2].payload.actionType, 'fight_target');
+	assert.equal((await h.call('programStatus')).engineState, 'SUSPENDED', 'the program stays paused');
+	h.finish(h.commands()[2], 'SUCCEEDED', 'TARGET_KILLED');
+	assert.equal((await second).reasonCode, 'TARGET_KILLED');
+});
+
+test('replaceAction of the exact danger-interrupted paused-program fight switches it; other handles are refused', async t => {
+	const h = runtimeHarness(t);
+	const { interrupted } = await interruptedPausedFight(h);
+	await assert.rejects(h.call('replaceAction', { actionId: 'not-the-handle', goalRevision: 1, actionType: 'flee_from', arguments: { targetId: ZOMBIE_B, distance: 12, timeoutMs: 8_000 } }),
+		{ code: 'NATIVE_PROGRAM_IN_PROGRESS' });
+	await assert.rejects(h.call('startAction', { actionType: 'flee_from', arguments: { targetId: ZOMBIE_B, distance: 12, timeoutMs: 8_000 } }),
+		{ code: 'NATIVE_PROGRAM_IN_PROGRESS' }, 'a plain startAction still cannot stack on the interrupted fight');
+	await assert.rejects(h.call('act', { actionType: 'wait', arguments: { durationMs: 5 } }), { code: 'NATIVE_PROGRAM_IN_PROGRESS' });
+	const replacement = h.call('replaceAction', { actionId: interrupted.actionId, goalRevision: 1, actionType: 'flee_from', arguments: { targetId: ZOMBIE_B, distance: 12, timeoutMs: 8_000 } });
+	await tick();
+	h.finish({ payload: { actionId: interrupted.actionId } }, 'CANCELLED');
+	await tick();
+	assert.equal(h.commands().at(-1).payload.actionType, 'flee_from');
+	h.finish(h.commands().at(-1), 'SUCCEEDED', 'FLED');
+	assert.equal((await replacement).state, 'SUCCEEDED');
+});
+
 test('fight/flee are still refused while the program owns the body (not paused)', async t => {
 	const h = runtimeHarness(t);
 	await h.call('runProgram', { background: true, timeoutMs: 60_000, source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1000);' });
