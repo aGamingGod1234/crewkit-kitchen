@@ -103,6 +103,14 @@ export async function runCrewkit({ brief: rawBrief, api, emit, enrollmentId, pol
   emit('reset', {});
   emit('brief', { guests: brief.guests, budget, needs: brief.needs.map(needText), title: brief.title });
 
+  // Live and simulate only (replay has no getEnrollment): a checkout needs an ACTIVE enrollment.
+  if (api.getEnrollment) {
+    let en = null;
+    try { en = await api.getEnrollment(enrollmentId); } catch (e) { log(`enrollment check ${e.code || e.message}`); }
+    const st = en?.status ?? en?.enrollment?.status ?? 'UNKNOWN';
+    if (st !== 'ACTIVE') return fail('failed', 'ENROLLMENT_NOT_ACTIVE', `Enrollment ${enrollmentId} is ${st}, not ACTIVE; finish enrollment before ordering`);
+  }
+
   // 1. Search; pick Reap's top result per need and keep the other results as permitted substitutes.
   const names = brief.guests.map((g) => g.name);
   const required = (n) => qtyFor(n.per, guestCount, n.qty);

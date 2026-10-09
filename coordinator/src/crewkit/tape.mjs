@@ -22,6 +22,7 @@ export async function liveApi({ simulate = false } = {}) {
     getQuote: (id) => c.getQuote(id),
     createCheckout: (quoteId, enrollmentId) => c.createCheckout(quoteId, enrollmentId, { simulate }),
     getCheckout: (id) => c.getCheckout(id),
+    getEnrollment: (id) => c.getEnrollment(id),
   };
 }
 
@@ -43,6 +44,7 @@ export function recordingApi(inner, { note = '' } = {}) {
       }
     };
   }
+  if (inner.getEnrollment) api.getEnrollment = inner.getEnrollment; // live-only pre-check, not taped
   api.save = (file) => { mkdirSync(dirname(file), { recursive: true }); writeFileSync(file, JSON.stringify(tape, null, 2)); return file; };
   return api;
 }

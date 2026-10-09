@@ -492,3 +492,16 @@ test('edge 6: COMPLETED without orderId or finalAmount fails COMPLETED_INCOMPLET
     assert.ok(!names(events).includes('completed') && !names(events).includes('record'));
   }
 });
+
+test('edge 7: a live api with a non-ACTIVE enrollment fails ENROLLMENT_NOT_ACTIVE before any search', async () => {
+  const stream = createEventStream({ runId: 't', sinks: [] });
+  const api = replayApi(tape, { speed: 0 });
+  let searched = 0;
+  const search = api.search;
+  api.search = (...a) => { searched += 1; return search(...a); };
+  api.getEnrollment = async () => ({ status: 'PENDING' });
+  const r = await runCrewkit({ brief, api, emit: stream.emit, enrollmentId: 'e', sleep: async () => {} });
+  assert.equal(r.status, 'ENROLLMENT_NOT_ACTIVE');
+  assert.equal(searched, 0);
+  assert.equal(names(stream.log).at(-1), 'failed');
+});
