@@ -79,6 +79,7 @@ public final class SetBuilder {
 		}
 
 		CrewkitAnchors.origin = origin.immutable();
+		builtInThisWorld = true;
 		data.update(origin.immutable(), dimension, true, palette, snapshot, bounds);
 		int placed = new Placer(level, origin).placeAll();
 		KitchenDecor.place(level, origin.immutable());
@@ -143,10 +144,15 @@ public final class SetBuilder {
 		return SetSavedData.get(server).built;
 	}
 
-	/** Called on server start: publish the persisted origin to CrewkitAnchors. */
+	/** Called on server start: publish this world's persisted origin, forgetting any from a previously opened world. */
 	public static void loadOrigin(MinecraftServer server) {
-		SetSavedData.get(server).origin().ifPresent(pos -> CrewkitAnchors.origin = pos);
+		java.util.Optional<BlockPos> saved = SetSavedData.get(server).origin();
+		builtInThisWorld = saved.isPresent();
+		CrewkitAnchors.origin = saved.orElse(new BlockPos(0, 100, 0));
 	}
+
+	/** True once this world has a kitchen, so the chef is never placed at a stale origin. */
+	public static volatile boolean builtInThisWorld;
 
 	static ServerLevel levelOf(MinecraftServer server, String dimension) {
 		ServerLevel level = server.getLevel(ResourceKey.create(Registries.DIMENSION, Identifier.parse(dimension)));

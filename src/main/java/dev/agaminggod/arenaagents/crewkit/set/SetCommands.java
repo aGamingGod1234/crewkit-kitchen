@@ -64,6 +64,12 @@ public final class SetCommands {
 		long ms = (System.nanoTime() - started) / 1_000_000L;
 		source.sendSuccess(() -> Component.literal("CrewKit kitchen built at " + origin.toShortString()
 				+ " (" + placed + " blocks, " + ms + " ms). Camera: ck_player anchor (14,5,19), facing north."), true);
+		// A chef summoned earlier follows the kitchen to its new spot.
+		if (dev.agaminggod.arenaagents.crewkit.cast.ChefReady.find(
+				dev.agaminggod.arenaagents.server.CodexAgentManager.get(source.getServer())).isPresent()) {
+			String status = dev.agaminggod.arenaagents.crewkit.cast.ChefReady.ready(source.getServer());
+			source.sendSuccess(() -> Component.literal(status), false);
+		}
 		return placed;
 	}
 

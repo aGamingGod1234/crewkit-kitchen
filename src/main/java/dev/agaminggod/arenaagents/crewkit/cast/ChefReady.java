@@ -36,6 +36,9 @@ public final class ChefReady {
 
 	/** Summons or reuses Chef and puts it at the anchor. Returns a one-line status for the operator. */
 	public static String ready(MinecraftServer server) {
+		if (!dev.agaminggod.arenaagents.crewkit.set.SetBuilder.builtInThisWorld) {
+			return "Build the kitchen first with /crewkit build, then run /crewkit chef ready.";
+		}
 		CodexAgentManager manager = CodexAgentManager.get(server);
 		Optional<AgentRecord> existing = find(manager);
 		String status;
@@ -77,7 +80,7 @@ public final class ChefReady {
 		chef.setDeltaMovement(Vec3.ZERO);
 	}
 
-	static Optional<AgentRecord> find(CodexAgentManager manager) {
+	public static Optional<AgentRecord> find(CodexAgentManager manager) {
 		return manager.records().stream()
 				.filter(record -> record.profile().userName().filter(NAME::equalsIgnoreCase).isPresent())
 				.findFirst();
