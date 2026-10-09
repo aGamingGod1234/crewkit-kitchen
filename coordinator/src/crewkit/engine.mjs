@@ -8,13 +8,20 @@ const TERMINAL = new Set(['COMPLETED', 'FAILED', 'EXPIRED']);
 const REQUOTE_CODES = new Set(['QUOTE_EXPIRED', 'QUOTE_REPLACEMENT_REQUIRED']);
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Bounds on what one brief may ask for, so a bad or hostile brief cannot fan out into unbounded API calls or spend.
+const LIMITS = { needs: 10, extras: 5, altQueries: 3, guests: 40, budget: 10000 };
+
 export function normalizeBrief(raw) {
   if (!raw || typeof raw !== 'object') throw new TypeError('brief must be an object');
   const budget = { amount: Number(raw.budget?.amount), currency: String(raw.budget?.currency || '').toUpperCase() };
   if (!(budget.amount > 0) || !/^[A-Z]{3}$/.test(budget.currency)) throw new TypeError('brief.budget needs amount > 0 and a 3-letter currency');
+  if (budget.amount > LIMITS.budget) throw new TypeError(`brief.budget.amount is capped at ${LIMITS.budget}`);
+  if ((raw.needs || []).length > LIMITS.needs) throw new TypeError(`brief.needs is capped at ${LIMITS.needs} items`);
+  if ((raw.extras || []).length > LIMITS.extras) throw new TypeError(`brief.extras is capped at ${LIMITS.extras} items`);
   const guests = (raw.guests || []).map((g) => (typeof g === 'string' ? { name: g, skin: null } : { name: String(g.name), skin: g.skin ?? null }));
   const guestCount = Number(raw.guestCount) || guests.length;
   if (!(guestCount > 0)) throw new TypeError('brief needs guests or guestCount');
+  if (guestCount > LIMITS.guests || guests.length > LIMITS.guests) throw new TypeError(`brief is capped at ${LIMITS.guests} guests`);
   // needs = mandatory quantities; extras = optional add-ons the rework may drop.
   const all = [...(raw.needs || []), ...(raw.extras || []).map((e) => (typeof e === 'string' ? { label: e, optional: true } : { ...e, optional: true }))];
   const needs = all.map((n, i) => {
@@ -25,6 +32,7 @@ export function normalizeBrief(raw) {
     need.id = String(need.id || need.label.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, ''));
     need.per = need.per || 'person';
     if (!PER.has(need.per)) throw new TypeError(`need ${need.id}: per must be person, pair or room`);
+    if ((need.altQueries || []).length > LIMITS.altQueries) throw new TypeError(`need ${need.id}: altQueries is capped at ${LIMITS.altQueries}`);
     need.queries = [need.query || need.label, ...(need.altQueries || [])];
     return need;
   });

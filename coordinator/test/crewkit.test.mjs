@@ -505,3 +505,15 @@ test('edge 7: a live api with a non-ACTIVE enrollment fails ENROLLMENT_NOT_ACTIV
   assert.equal(searched, 0);
   assert.equal(names(stream.log).at(-1), 'failed');
 });
+
+test('edge 8: brief caps reject oversize needs, extras, altQueries, guests and budget', async () => {
+  const { normalizeBrief } = await import('../src/crewkit/engine.mjs');
+  const ok = { budget: SGD(100), guestCount: 2, needs: ['pen'] };
+  assert.doesNotThrow(() => normalizeBrief({ ...ok, needs: Array.from({ length: 10 }, (_, i) => `n${i}`), extras: ['a', 'b', 'c', 'd', 'e'], guestCount: 40, budget: SGD(10000) }));
+  assert.throws(() => normalizeBrief({ ...ok, needs: Array.from({ length: 11 }, (_, i) => `n${i}`) }), /needs is capped at 10/);
+  assert.throws(() => normalizeBrief({ ...ok, extras: ['a', 'b', 'c', 'd', 'e', 'f'] }), /extras is capped at 5/);
+  assert.throws(() => normalizeBrief({ ...ok, needs: [{ label: 'pen', altQueries: ['a', 'b', 'c', 'd'] }] }), /altQueries is capped at 3/);
+  assert.throws(() => normalizeBrief({ ...ok, guestCount: 41 }), /capped at 40 guests/);
+  assert.throws(() => normalizeBrief({ ...ok, guestCount: undefined, guests: Array.from({ length: 41 }, (_, i) => `g${i}`) }), /capped at 40 guests/);
+  assert.throws(() => normalizeBrief({ ...ok, budget: SGD(10000.01) }), /capped at 10000/);
+});
