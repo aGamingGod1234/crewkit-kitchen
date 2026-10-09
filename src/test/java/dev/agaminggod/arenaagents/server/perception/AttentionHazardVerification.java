@@ -111,7 +111,27 @@ public final class AttentionHazardVerification {
 				"the policy raises none of the routine changes the heartbeat carries");
 		after.getAsJsonObject("player").addProperty("fallDistance", 6.0D);
 		assertTrue(AttentionSignalPolicy.changedFacts(before, after).contains("player.fallDistance"), "and raises the fall that matters");
-		return 19;
+		return 19 + verifyThreatSignalsForceNow();
+	}
+
+	/** A creeper explodes 1.5 s after it starts swelling: every threat signal that rises goes out the same tick. */
+	private static int verifyThreatSignalsForceNow() {
+		var rest = raw(20, 20, 5, false, false, 300, false, true, 0.0D, null, 0L);
+		var calm = rawWithSignals(java.util.Set.of("mob:targeting"));
+		for (String signal : java.util.List.of("targeting", "swelling", "creeper_close", "imminent", "ranged_sight", "attacked")) {
+			if (!signal.equals("targeting")) {
+				assertTrue(rawWithSignals(java.util.Set.of("mob:targeting", "mob:" + signal)).requiresForcedAttention(calm, false),
+						signal + " rising on a threat that already has signals goes out now");
+			}
+			assertTrue(rawWithSignals(java.util.Set.of("mob:" + signal)).requiresForcedAttention(rest, false),
+					signal + " rising on a threat that had none goes out now");
+		}
+		assertFalse(rest.requiresForcedAttention(calm, false), "a signal expiring is only a quiet refresh");
+		return 12;
+	}
+
+	private static ServerObservationCollector.RawPlayerState rawWithSignals(java.util.Set<String> signals) {
+		return new ServerObservationCollector.RawPlayerState(20, 20, 5, false, false, 300, false, true, 0.0D, null, 0L, signals);
 	}
 
 	private static ServerObservationCollector.RawPlayerState raw(double health, int food, double saturation, boolean onFire,
