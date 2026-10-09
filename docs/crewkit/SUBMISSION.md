@@ -20,7 +20,20 @@ CrewKit Kitchen helps a student-club workshop organiser turn an attendee list in
 
 The user is a student-club workshop organiser with an attendee list and a small approved budget. Turning that list into an order is tedious and error-prone: comparing products across listings, working out which items are per person and which are shared, adding shipping to the total, and forgetting items. A mistake means a second order or an over-budget one. An agent can do the legwork, but the organiser needs to check what it did without reading a chat log.
 
-> Organiser quote: "TODO: short testimonial from a workshop organiser." (TODO: name, club)
+> TODO: organiser testimonial (quote, name, club)
+
+## Proof: a real sandbox run
+
+A real Reap sandbox run completed: order `ord_01M4G0J3JSEP31G7NASSA0K649` at Popular Bookstore (Singapore), 6 guests, budget S$105.
+
+- The first real quote was S$196.85, so the server gate blocked checkout.
+- Sandbox stock was limited. Badges and notebooks were sold out at quantity 6, and no single cable listing had 3. The agent swapped to in-stock listings and split quantities (cables 1+1+1, notebooks 3+3).
+- Rework took the quote from S$196.85 to S$137.25, S$131.65, then S$102.75, and dropped only the optional sticky notes.
+- The requirements check and the gate passed. A human approved on Reap's hosted page with a passkey.
+- Reap reported `COMPLETED`. Charged S$102.75, variance S$0.00, 154 Reap API calls. Reap returned several 503 responses and the backoff recovered.
+- The demo replay is that recorded run, with the approval URL redacted. This is the sandbox: no real money moved, and delivery is visualized.
+
+In the kitchen: a fan of candidate products from real search results, ghost plates for the cart that turn solid when paid, a typewriter bill, and a written-book receipt. The chef answers by voice (OpenAI speech-to-text and text-to-speech through Simple Voice Chat) and speaks lines at key beats. It is summoned and placed automatically and cannot mine or wander.
 
 ## Solution
 
@@ -71,9 +84,7 @@ Enrollment, quote, and checkout calls send an `Idempotency-Key`. The bill board 
 
 ## Links
 
-- Demo video: `TODO`
-- Repository: `TODO` (public, MIT)
-- Live demo / hosted page: `TODO`
+- Demo video: TODO (link)
+- Repository: https://github.com/aGamingGod1234/crewkit-kitchen (public, MIT)
 - Plan: https://mwvetbk1qiwd.postplan.dev
-- Team: `TODO`
-- Organiser testimonial: `TODO` (see the quote placeholder under Problem)
+- Team: The Greek Warriors. `TODO: member names`

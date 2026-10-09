@@ -4,7 +4,7 @@
 
 Built for the Reap x 65labs Agentic Buildathon (Singapore). Track: Most Worthwhile Problem. Build path: Reap Agentic API (sandbox).
 
-Demo video: `TODO: add link`
+Demo video: TODO (link)
 
 ## The problem
 
@@ -27,7 +27,28 @@ When both checks pass, Reap returns a hosted approval page. A human scans a QR c
 
 The room is the audit log. A red ticket means over budget. Dropped gate bars mean the checkout is blocked. A bag at the door means Reap reported the order placed.
 
-> "TODO: short quote from a workshop organiser." (TODO: name, club)
+> TODO: organiser testimonial (quote, name, club)
+
+## What's real: a recorded sandbox run
+
+A real Reap sandbox run completed, and the demo replay is that recorded run (the approval URL is redacted).
+
+- **Order:** `ord_01M4G0J3JSEP31G7NASSA0K649` at Popular Bookstore (Singapore). 6 guests, budget S$105.
+- **Gate fired:** the first real quote was S$196.85, so the server gate blocked checkout.
+- **Stock was limited:** badges and notebooks were sold out at quantity 6, and no single cable listing had 3. The agent swapped to in-stock listings and split quantities (cables 1+1+1, notebooks 3+3).
+- **Rework:** the quote went S$196.85, S$137.25, S$131.65, S$102.75. It dropped only the optional sticky notes.
+- **Checks passed:** the requirements check and the budget gate both passed. A human approved on Reap's hosted page with a passkey.
+- **Result:** `COMPLETED`, charged S$102.75, variance S$0.00. The run used 154 Reap API calls. Reap returned several 503 responses and our backoff recovered.
+
+This is the sandbox. No real money moved, and delivery is visualized, not shipped.
+
+## What you see in the kitchen
+
+- A fan of candidate products from real search results.
+- Ghost plates for the cart, which turn solid once paid.
+- A typewriter bill and a written-book receipt.
+- The chef answers by voice (OpenAI speech-to-text and text-to-speech through Simple Voice Chat) and speaks lines at key beats.
+- The chef is summoned and placed automatically. It cannot mine or wander.
 
 ## How it works
 
@@ -73,21 +94,28 @@ flowchart LR
 
 ## Quick start
 
-Placeholders: other tracks fill in exact commands.
-
-```text
-# 1. Build and install the mod and coordinator (see "Agent Arena" below)
-TODO
-
-# 2. Build the kitchen in your world
-/crewkit build
-
-# 3. Copy the env template and add your Reap sandbox key
-#    coordinator/src/crewkit/.env  (gitignored)
-
-# 4. Run the chef
-node coordinator/src/crewkit/cli.mjs run <brief> --mode replay|simulate|live
-```
+1. **Game and Java.** Minecraft Java 26.1.2 with Fabric Loader 0.19.3, Fabric API, and Fabric Carpet. Java 25.
+2. **Mod.** Put the CrewKit jar from [Releases](https://github.com/aGamingGod1234/crewkit-kitchen/releases) into `mods/`. Only one `arenaagents` jar may be installed, so remove any other Agent Arena jar.
+3. **Voice (optional).** Install Simple Voice Chat 2.6.21 or newer and the `arena-agents-voice` jar. Set `OPENAI_API_KEY` as a user environment variable.
+4. **Node for the coordinator.** The mod needs Node 22 or newer at this exact path, and it does not use the system PATH:
+   ```text
+   .minecraft\arena-agents-runtime\runtime\toolchains\node\node.exe
+   ```
+   You can point somewhere else with the JVM flag `-Darenaagents.nodePath=<path to node.exe>`.
+5. **Reap key (simulate or live mode only).** Put `REAP_API_KEY` and `REAP_EMAIL` in `coordinator/src/crewkit/.env` (gitignored). Replay needs no key.
+6. **In game.**
+   ```text
+   /crewkit build            (or: /crewkit build here)
+   /crewkit stage            (summons Chef, Claude Opus 5.5 low; the Claude CLI must be logged in)
+   /ckcam on
+   /codex voice-consent on
+   ```
+   Then talk to Chef, or send `/msg Chef <order>`. The exact demo message is in [docs/crewkit/AGENT-RUN.md](docs/crewkit/AGENT-RUN.md).
+7. **Between takes.** `/crewkit reset`, then `/crewkit chef ready`.
+8. **Developer CLI.**
+   ```text
+   node coordinator/src/crewkit/cli.mjs run [brief] --mode replay|simulate|live
+   ```
 
 | Mode | What it does |
 |---|---|
@@ -99,7 +127,9 @@ Docs: [contract](docs/crewkit/CONTRACT.md), [brief and script](docs/crewkit/brie
 
 ## Team
 
-`TODO: names and roles`
+The Greek Warriors. `TODO: member names`
+
+Repository: https://github.com/aGamingGod1234/crewkit-kitchen (public, MIT)
 
 ## License
 

@@ -20,7 +20,11 @@ It is the shared visual interface, not the point. A chat log needs reading. A ro
 
 ## Do you have user feedback?
 
-`TODO: short testimonial from a workshop organiser (name, club).` Add it here and in the submission text, or delete this entry if there is none.
+TODO: organiser testimonial (quote, name, club).
+
+## Did it work against the real Reap sandbox?
+
+Yes. A real run completed: order `ord_01M4G0J3JSEP31G7NASSA0K649` at Popular Bookstore (Singapore), 6 guests, budget S$105. The first real quote was S$196.85, so the server gate blocked checkout. Badges and notebooks were sold out at quantity 6 and no single cable listing had 3, so the agent swapped to in-stock listings and split quantities (cables 1+1+1, notebooks 3+3). Rework took the quote from S$196.85 to S$137.25, S$131.65, then S$102.75, dropping only the optional sticky notes. Both checks passed, a human approved on Reap's hosted page with a passkey, and Reap returned `COMPLETED`: charged S$102.75, variance S$0.00, 154 API calls. Reap returned several 503 responses and the backoff recovered. The demo replay is that recorded run with the approval URL redacted. It is the sandbox, so no real money moved, and delivery is visualized.
 
 ## Is the Minecraft part pre-built?
 
@@ -67,7 +71,10 @@ It depends on the mode, and we label it. In `live` mode a human approves on Reap
 | Approval QR and page | Reap's real hosted page |
 | Order status and `orderId` | From Reap's checkout response |
 | Minecraft kitchen: bag arriving, plating, sounds | Choreographed. It plays on events from the engine, and only the `completed` event starts delivery |
-| Over-budget moment in the demo | The budget is set so the first cart comes in over. The gate is real, the budget is chosen to show it |
+| Over-budget moment in the demo | Real. In the recorded run the first real quote was S$196.85 against a S$105 budget and the gate blocked checkout |
+| Demo replay | The recorded real sandbox run, approval URL redacted. Replay mode makes no network calls |
+| Chef voice and spoken lines | OpenAI speech-to-text and text-to-speech through Simple Voice Chat. Spoken lines at key beats are scripted |
+| Typewriter bill, written-book receipt, ghost plates turning solid | Kitchen visuals driven by the engine's events |
 | Guest names and seating | From the brief |
 | `replay` and `simulate` modes | Recorded or simulated, and labeled as such. `simulate` uses `X-Simulate-Checkout` |
 
