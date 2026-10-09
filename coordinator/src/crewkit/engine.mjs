@@ -180,7 +180,10 @@ export async function runCrewkit({ brief: rawBrief, api, emit, enrollmentId, pol
         continue;
       }
       const to = await resolveVariant(ch.to);
-      if (!to) continue; // substitute vanished; the next quote and gate decide
+      if (!to) { // substitute vanished; drop it so the next rework cannot pick it again
+        item.alternates = item.alternates.filter((a) => a !== ch.to);
+        continue;
+      }
       const need = brief.needs.find((n) => n.id === item.needId);
       emit('item_removed', { id: item.id, qtyRemoved: item.qty, why: 'swap for a cheaper substitute' });
       const qty = item.qty;
