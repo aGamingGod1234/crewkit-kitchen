@@ -12,7 +12,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
 
 /**
- * /crewkit chef &lt;player&gt; | clear : who wears the chef skin and gets walked around.
+ * /crewkit chef ready | &lt;player&gt; | clear : ready summons or reuses the real Chef agent at the anchor; who wears the chef skin and gets walked around.
  * /crewkit cast brief [names] | item | completed | reset : rehearse the cast without the coordinator
  * (animation needs the CrewKit dispatcher to be ticking the feature).
  */
@@ -21,12 +21,23 @@ public final class CastCommands {
 
 	public static void register() {
 		CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> register(dispatcher));
+		ChefReady.register();
 	}
 
 	private static void register(CommandDispatcher<CommandSourceStack> dispatcher) {
 		dispatcher.register(Commands.literal("crewkit")
 				.requires(source -> Commands.LEVEL_GAMEMASTERS.check(source.permissions()))
 				.then(Commands.literal("chef")
+						.then(Commands.literal("ready").executes(context -> {
+							try {
+								String status = ChefReady.ready(context.getSource().getServer());
+								context.getSource().sendSuccess(() -> Component.literal(status), true);
+								return 1;
+							} catch (RuntimeException exception) {
+								context.getSource().sendFailure(Component.literal("Chef not ready: " + exception.getMessage()));
+								return 0;
+							}
+						}))
 						.then(Commands.literal("clear").executes(context -> {
 							CastFeature.assignChef(context.getSource().getServer(), null);
 							context.getSource().sendSuccess(() -> Component.literal("CrewKit chef cleared"), true);

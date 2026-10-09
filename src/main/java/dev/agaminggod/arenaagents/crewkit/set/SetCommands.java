@@ -76,7 +76,7 @@ public final class SetCommands {
 		return 1;
 	}
 
-	/** Demo conditions: noon, clear sky, frozen time and weather, no mob spawning. */
+	/** Demo conditions: noon, clear sky, frozen time and weather, no mob spawning, and the Chef agent at its anchor. */
 	private static int stage(CommandSourceStack source) {
 		MinecraftServer server = source.getServer();
 		CommandSourceStack quiet = server.createCommandSourceStack().withSuppressedOutput();
@@ -91,6 +91,13 @@ public final class SetCommands {
 		rules.set(GameRules.SPAWN_PATROLS, false, server);
 		rules.set(GameRules.SPAWN_WANDERING_TRADERS, false, server);
 		source.sendSuccess(() -> Component.literal("CrewKit stage set: noon, clear, time/weather frozen, mob spawning off."), true);
+		try {
+			String chef = dev.agaminggod.arenaagents.crewkit.cast.ChefReady.ready(server);
+			source.sendSuccess(() -> Component.literal(chef), true);
+		} catch (RuntimeException exception) {
+			// Staging still counts without an agent; the mannequin chef covers the run.
+			source.sendFailure(Component.literal("Chef not ready: " + exception.getMessage()));
+		}
 		return 1;
 	}
 }

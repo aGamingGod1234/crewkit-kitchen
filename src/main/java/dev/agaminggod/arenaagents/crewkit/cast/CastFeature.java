@@ -74,6 +74,10 @@ public final class CastFeature implements CrewkitFeature {
 	private static Leg chefLeg;
 	private static String chefName;
 	private static UUID chefNpc;
+	/** From brief until the run ends, an agent chef's own inputs are held so they never fight the choreography. */
+	private static boolean runActive;
+	private static boolean releaseWhenIdle;
+	private static Vec3 holdPos;
 	private static int itemsWalked;
 	private static long clock;
 
@@ -139,7 +143,12 @@ public final class CastFeature implements CrewkitFeature {
 	@Override
 	public void onEvent(MinecraftServer server, String event, JsonObject data, long seq) {
 		switch (event) {
-			case "brief" -> brief(server, data);
+			case "brief" -> {
+				runActive = true;
+				releaseWhenIdle = false;
+				holdPos = null;
+				brief(server, data);
+			}
 			case "item_added" -> {
 				ensureChef(server);
 				chefQueueWalk(pantryPos(itemsWalked++), 0, 180f);
@@ -150,7 +159,9 @@ public final class CastFeature implements CrewkitFeature {
 				ensureChef(server);
 				chefQueueWalk(doorPos(), 0, -90f);
 				for (int i = 0; i < GUESTS.size(); i++) GUESTS.get(i).lookAtPlateAt = clock + 20 + i * 4L;
+				releaseWhenIdle = true;
 			}
+			case "failed", "expired" -> runActive = false;
 			case "reset" -> reset(server);
 			default -> { }
 		}
@@ -181,6 +192,9 @@ public final class CastFeature implements CrewkitFeature {
 		chefLeg = null;
 		chefNpc = null;
 		itemsWalked = 0;
+		runActive = false;
+		releaseWhenIdle = false;
+		holdPos = null;
 		// The chef team (skin) stays: it belongs to the agent, not to a run.
 	}
 
@@ -333,6 +347,11 @@ public final class CastFeature implements CrewkitFeature {
 	}
 
 	private static void tickChef(MinecraftServer server) {
+		if (runActive && releaseWhenIdle && !chefBusy()) {
+			runActive = false;
+			releaseWhenIdle = false;
+		}
+		if (runActive) holdAgentChef(server);
 		if (chefLeg == null) {
 			chefLeg = CHEF_LEGS.poll();
 			if (chefLeg == null) return;
@@ -343,7 +362,20 @@ public final class CastFeature implements CrewkitFeature {
 			CHEF_LEGS.clear();
 			return;
 		}
-		if (stepLeg(chef, chefLeg, true)) chefLeg = null;
+		if (stepLeg(chef, chefLeg, true)) {
+			chefLeg = null;
+			holdPos = chef.position();
+		}
+	}
+
+	/** Keeps an agent chef still between choreography legs while a run is on: its own movement never wins. */
+	private static void holdAgentChef(MinecraftServer server) {
+		Entity chef = resolveChef(server);
+		if (!(chef instanceof carpet.patches.EntityPlayerMPFake fake)) return;
+		dev.agaminggod.arenaagents.server.OfflineAgentPlayers.stop(fake);
+		if (chefBusy()) return;
+		if (holdPos == null) holdPos = fake.position();
+		else if (fake.position().distanceToSqr(holdPos) > 1.0E-4) place(fake, holdPos, fake.getYRot(), 0f);
 	}
 
 	// ---------------------------------------------------------------- movement
