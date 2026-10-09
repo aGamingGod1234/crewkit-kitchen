@@ -17,4 +17,4 @@
 {"t":43500,"seq":17,"event":"calls","data":{"count":10}}
 {"t":57500,"seq":18,"event":"calls","data":{"count":12}}
 {"t":58500,"seq":19,"event":"completed","data":{"orderId":"ord_sbx_7Q2K9","finalAmount":{"amount":149.7,"currency":"SGD"}}}
-{"t":64500,"seq":20,"event":"record","data":{"budget":150,"quoted":149.7,"charged":149.7,"variance":0.3,"orderId":"ord_sbx_7Q2K9","currency":"SGD"}}
+{"t":64500,"seq":20,"event":"record","data":{"budget":150,"quoted":149.7,"charged":149.7,"variance":0,"orderId":"ord_sbx_7Q2K9","currency":"SGD"}}

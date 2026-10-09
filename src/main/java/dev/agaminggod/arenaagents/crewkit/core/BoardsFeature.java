@@ -46,6 +46,8 @@ public final class BoardsFeature implements CrewkitFeature {
 	private int timerColor = CrewkitText.WHITE;
 	private String lastTimerText = "";
 	private int callCount;
+	/** Once a run reports absolute `calls` counts (the Node engine does, before its first item), stop estimating +1 per item. */
+	private boolean callsReported;
 
 	// Bill board
 	private CrewkitDisplay billPanel, billTitle;
@@ -63,6 +65,7 @@ public final class BoardsFeature implements CrewkitFeature {
 				cart = 0;
 				unitPrices.clear();
 				callCount = 0;
+				callsReported = false;
 				ensureBudgetBoard(server);
 				ensureBill(server);
 				remaining.snap(0);
@@ -83,7 +86,7 @@ public final class BoardsFeature implements CrewkitFeature {
 				if (id != null) unitPrices.put(id, unit);
 				cart += unit * qty;
 				rollTo(budget - cart, ROLL_TICKS, now);
-				updateCalls(server, callCount + 1, true);
+				if (!callsReported) updateCalls(server, callCount + 1, true);
 			}
 			case "item_removed" -> {
 				ensureBudgetBoard(server);
@@ -136,6 +139,7 @@ public final class BoardsFeature implements CrewkitFeature {
 			}
 			case "calls" -> {
 				ensureBudgetBoard(server);
+				callsReported = true;
 				updateCalls(server, (int) number(data, "count", callCount), true);
 			}
 			case "record" -> stampRecord(server, data);
@@ -188,6 +192,7 @@ public final class BoardsFeature implements CrewkitFeature {
 		timerColor = CrewkitText.WHITE;
 		lastTimerText = "";
 		callCount = 0;
+		callsReported = false;
 	}
 
 	// ---- budget board ----
@@ -307,7 +312,7 @@ public final class BoardsFeature implements CrewkitFeature {
 		double budgetValue = number(data, "budget", budget);
 		double quoted = number(data, "quoted", 0);
 		double charged = number(data, "charged", 0);
-		double variance = number(data, "variance", budgetValue - charged);
+		double variance = number(data, "variance", charged - quoted); // same meaning as the engine: charged - quoted
 		String orderId = string(data, "orderId");
 		int verdict = charged <= budgetValue + 0.004 ? CrewkitText.GREEN : CrewkitText.RED;
 		String[] values = {
