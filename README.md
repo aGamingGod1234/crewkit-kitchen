@@ -1,6 +1,6 @@
 # CrewKit Kitchen
 
-**An AI chef buys your event's supplies through Reap's Agentic API, inside a budget you set, and you can watch every step happen in a Minecraft kitchen.**
+**An AI chef turns a workshop attendee list into a complete supply order through Reap's Agentic API, inside a small approved budget, and a Minecraft kitchen shows every step.**
 
 Built for the Reap x 65labs Agentic Buildathon (Singapore). Track: Most Worthwhile Problem. Build path: Reap Agentic API (sandbox).
 
@@ -8,13 +8,26 @@ Demo video: `TODO: add link`
 
 ## The problem
 
-Companies and event teams are starting to let agents spend money: workshop kits, team offsites, office supplies. The hard part is not placing the order. It is trusting it. Today the agent's work is a chat log. You cannot see at a glance what it bought, whether it stayed in budget, who approved the payment, or whether the order really went through.
+**The user:** a student-club workshop organiser. They have an attendee list and a small approved budget, and they need a complete supply order: badges, notebooks, pens, drinks, shared cables, a speaker.
+
+**The pain:** turning that list into an order is tedious and easy to get wrong. The organiser has to compare products across listings, work out which items are per person and which are shared, add shipping to the total, and remember everything. One forgotten item or one over-budget cart means a second order.
+
+**Why an agent, and why this one:** an agent can do the legwork, but the organiser still has to trust the result. CrewKit makes the agent's work checkable. Minecraft is the shared visual interface that shows the state of the order to everyone in the room. It is the display, not the point.
 
 ## What CrewKit does
 
-You give the chef a brief: guests, a budget, what each person needs. The chef searches Reap's catalogue, builds a cart, and asks Reap for a quote. Our server checks the quote against the budget. If it is over, the checkout is blocked and the chef has to rework the cart. When the total fits, Reap returns a hosted approval page. A human scans a QR code and approves on that page. Only when Reap reports the order as `COMPLETED` does the kitchen celebrate, plate the items for each named guest, and stamp a bill board with budget, quoted, charged, variance, and order id.
+The organiser gives the chef a brief: guests, a budget, and what each person needs. The chef searches Reap's catalogue, builds a cart, and asks Reap for a quote. Two server checks run before any checkout:
 
-The room is the audit log. A red ticket means over budget. Dropped gate bars mean the checkout is blocked. A bag at the door means Reap placed the order.
+1. **Requirements check.** Every mandatory quantity is covered, for example one badge per guest and one cable per pair.
+2. **Budget gate.** The quote total, shipping included, is within budget.
+
+If either check fails, no checkout is created. For a budget failure, the chef reworks the cart by substituting cheaper products while keeping the requirements. If nothing fits, the brief is reported as infeasible instead of quietly dropping items.
+
+When both checks pass, Reap returns a hosted approval page. A human scans a QR code and approves there. When Reap reports the order as `COMPLETED`, the kitchen shows the order as placed, plays the delivery and plating scene for each named guest, and stamps a bill board with budget, quoted, charged, variance, and order id. Order placed; delivery visualized. The sandbox does not ship anything.
+
+The room is the audit log. A red ticket means over budget. Dropped gate bars mean the checkout is blocked. A bag at the door means Reap reported the order placed.
+
+> "TODO: short quote from a workshop organiser." (TODO: name, club)
 
 ## How it works
 
@@ -23,9 +36,9 @@ flowchart LR
     Human([Human: writes brief]) --> Chef[Chef agent<br/>LLM plans the cart]
     Chef -->|tool calls| Engine[CrewKit engine<br/>coordinator/src/crewkit]
     Engine -->|search, quote, checkout, poll| Reap[Reap Agentic API<br/>sandbox]
-    Engine --> Gate{Server budget gate}
-    Gate -->|over budget| Chef
-    Gate -->|within budget| Engine
+    Engine --> Gate{Server checks:<br/>requirements + budget gate}
+    Gate -->|fails: rework or infeasible| Chef
+    Gate -->|passes| Engine
     Reap -->|approval URL| Page[Reap hosted approval page]
     Page -->|QR scan, approve| Human2([Human approves on phone])
     Human2 --> Page
@@ -43,10 +56,10 @@ flowchart LR
 
 ## Money safety
 
-- **The budget gate lives on the server.** The chef can propose any cart. Our code compares the Reap quote total, with shipping, to the budget and refuses to create a checkout when it is over. The model cannot skip this step.
+- **Two checks live on the server.** The chef can propose any cart. Our code checks that every mandatory quantity is covered and that the shipping-inclusive quote is within budget. Over-budget quotes cannot create a checkout through our tool. The model cannot skip these checks. This is a property of our tool, not of Reap's API: a client that bypasses our tool is not covered.
 - **The key and card never reach the LLM.** The Reap API key stays in a gitignored `.env` read by the engine. Card details are entered on Reap's hosted pages and never pass through our code or logs.
 - **A human approves every purchase.** Reap mandates (pre-approved spending) are not live yet, so each checkout needs approval on Reap's hosted page.
-- **Celebrate only on `COMPLETED`.** Reap defines it as "the merchant order is placed". `PROCESSING`, `FAILED`, and `EXPIRED` never trigger the delivery scene.
+- **Show the delivery scene only on `COMPLETED`.** Reap defines it as "the merchant order is placed". `PROCESSING`, `FAILED`, and `EXPIRED` never trigger it. The scene visualizes delivery; it does not confirm that goods arrived.
 - **Idempotency.** Every enrollment, quote, and checkout call carries an `Idempotency-Key` that is stored before sending. A retry replays the same result and cannot double-buy.
 - **Reconcile against what was charged.** The bill board uses `finalAmount` from the checkout, not the quote.
 
@@ -54,7 +67,9 @@ flowchart LR
 
 - The Minecraft agent platform underneath is **Agent Arena**, existing work by the project owner, published under MIT. The fork's base content is kept below.
 - **Built at the event:** the Reap purchasing client, the chef and its tools, the budget gate, the run record, the `crewkit_state` bridge message, the kitchen set, the visual choreography, and this documentation. Everything under `coordinator/src/crewkit/`, `src/main/java/dev/agaminggod/arenaagents/crewkit/`, and `docs/crewkit/` is new.
-- This runs against the **Reap sandbox**. No real money moves.
+- This runs against the **Reap sandbox**. No real money moves and nothing ships.
+- Two things are separate in a demo run. **Hosted approval** is a real human step on Reap's sandbox page. **Simulated completion** (`X-Simulate-Checkout: COMPLETED`, used in `simulate` mode) skips that step, and the run is labeled simulated.
+- CrewKit makes no onchain claims.
 
 ## Quick start
 
@@ -77,8 +92,8 @@ node coordinator/src/crewkit/cli.mjs run <brief> --mode replay|simulate|live
 | Mode | What it does |
 |---|---|
 | `replay` | Plays a recorded run through the kitchen. No network. |
-| `simulate` | Calls the sandbox with `X-Simulate-Checkout: COMPLETED`. |
-| `live` | Full flow: sandbox card, hosted approval page, polling. |
+| `simulate` | Calls the sandbox with `X-Simulate-Checkout: COMPLETED`. Completion is simulated. |
+| `live` | Full flow: sandbox card, hosted approval page, polling. Approval is a real human step. |
 
 Docs: [contract](docs/crewkit/CONTRACT.md), [brief and script](docs/crewkit/brief-and-script.md), [Reap API notes](docs/crewkit/reap-api-notes.md), [submission text](docs/crewkit/SUBMISSION.md), [judge Q&A](docs/crewkit/JUDGE-QA.md).
 

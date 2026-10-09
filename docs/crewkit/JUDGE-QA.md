@@ -4,15 +4,23 @@ Short answers. Say only what is true today. Sandbox means no real money moves.
 
 ## What problem does this solve, and who is the user?
 
-Teams that let an AI agent buy things need to see and control what it does. The user is the person who owns the spend: an event organizer, an office or ops manager, a club treasurer. They write the brief and approve the purchase. Other people in the room, such as finance or the guests, can read the state of the order from the kitchen without opening logs.
+One user: a student-club workshop organiser. They have an attendee list and a small approved budget. Turning that into an order means comparing products, working out per-person versus shared quantities, adding shipping, and not forgetting anything. CrewKit does that legwork and makes the result checkable.
 
 ## Why is it worthwhile for business spend and event ops?
 
-Event kits are small, repeated, and error-prone: per-person items, shared items, a fixed budget, a delivery date. They are a good first place to hand an agent real purchasing because the cost of a mistake is capped. CrewKit adds the three controls finance asks for: a hard budget, a named human approval, and a record that compares what was budgeted, quoted, and charged.
+Workshop kits are small, repeated, and easy to get wrong: per-person items, shared items, a fixed budget. A mistake costs a second order or an over-budget cart. The same pattern applies to team offsites and office supplies, but we built and tested for the workshop case. CrewKit adds the controls an approver wants: a requirements check, a budget gate, human approval on Reap's page, and a record that compares what was budgeted, quoted, and charged.
+
+## What happens if the budget is too small?
+
+The chef reworks the cart by substituting cheaper products while keeping the requirements (every mandatory quantity). If no combination fits, the brief is reported infeasible. It does not drop required items to hit the number.
 
 ## Why Minecraft?
 
-Because trust in an agent is a visibility problem. A chat log needs reading. A room can be read at a glance: a red ticket is over budget, dropped bars mean blocked, a bag at the door means the order is placed. It also gives the demo a physical story anyone can follow in 2 minutes. The engine does not depend on Minecraft; the kitchen is one front end for the same event stream.
+It is the shared visual interface, not the point. A chat log needs reading. A room can be read at a glance: a red ticket is over budget, dropped bars mean blocked, a bag at the door means Reap reported the order placed. It also gives a demo anyone can follow in 2 minutes. The engine does not depend on Minecraft; the kitchen is one front end for the same event stream.
+
+## Do you have user feedback?
+
+`TODO: short testimonial from a workshop organiser (name, club).` Add it here and in the submission text, or delete this entry if there is none.
 
 ## Is the Minecraft part pre-built?
 
@@ -30,9 +38,9 @@ The human writes the brief and approves on Reap's hosted page. Mandates (pre-app
 
 Each checkout comes from one quote and needs its own approval. If the quote expires or Reap asks for a replacement quote, the chef re-quotes and a new approval QR appears. Reap's docs do not say what happens if the merchant changes the price after approval, so we do not claim a behavior there. The bill board reports the variance between quoted and charged.
 
-## How is the budget enforced? Can the model overspend?
+## How is the budget enforced?
 
-Enforcement is server code, not a prompt. The engine compares the Reap quote total (items, shipping, tax) with the budget before it calls `POST /agentic/checkouts`. If the total is over, no checkout exists. The model can only change the cart and ask again.
+Enforcement is server code, not a prompt. Two checks run before `POST /agentic/checkouts`: a requirements check (every mandatory quantity is covered) and the budget gate (the shipping-inclusive quote is within budget). Over-budget quotes cannot create a checkout through our tool. The model can only change the cart and ask again. This is a property of our tool, not of Reap's API.
 
 ## Security: what does the model see?
 
@@ -42,9 +50,13 @@ The model sees product names, prices, the budget, and tool results. It never see
 
 Enrollment, quote, and checkout calls carry an `Idempotency-Key`, generated per logical operation and stored before sending. A retry with the same key replays the first response. A checkout that reaches `COMPLETED`, `FAILED`, or `EXPIRED` is terminal and is never retried in place.
 
-## Why not celebrate when the checkout is created or approved?
+## Why not show the delivery scene when the checkout is created or approved?
 
-Approval is not delivery. The delivery scene fires only when polling returns `COMPLETED`. `PROCESSING` shows the hourglass. `FAILED` and `EXPIRED` send the ticket back to the rail.
+Approval is not an order. The scene plays only when polling returns `COMPLETED`: order placed; delivery visualized. We do not claim goods were delivered or that everyone received supplies, because the sandbox ships nothing. `PROCESSING` shows the hourglass. `FAILED` and `EXPIRED` send the ticket back to the rail.
+
+## Was the approval real in the demo?
+
+It depends on the mode, and we label it. In `live` mode a human approves on Reap's sandbox hosted page. In `simulate` mode we send `X-Simulate-Checkout: COMPLETED`, which does not involve the approval page, and the run is labeled simulated. We make no onchain claims.
 
 ## What is live and what is choreographed?
 

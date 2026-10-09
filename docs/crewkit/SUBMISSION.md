@@ -8,28 +8,34 @@ CrewKit Kitchen
 
 ## Tagline (<= 100 characters)
 
-An AI chef buys your event supplies with Reap, and you watch every step in a Minecraft kitchen.
+An AI chef turns a workshop guest list into a budget-checked Reap order, shown in Minecraft.
 
-(94 characters.)
+(93 characters.)
 
 ## Description (~150 words)
 
-CrewKit Kitchen lets an AI agent buy an event's supplies through Reap's Agentic API while a human can see exactly what it does. You give the chef a brief: guests, a budget, what each person needs. It searches Reap's catalogue, builds a cart, and requests a quote. Our server checks the total against the budget and blocks the checkout if it is over, so the chef has to rework the cart. When it fits, a QR code appears. You scan it and approve on Reap's hosted page. When Reap reports the order as COMPLETED, a delivery bag arrives, the chef plates items for each named guest, and a bill board shows budget, quoted, charged, variance, and order id. Every checkout step is a physical action in a Minecraft kitchen, so you audit the agent by looking at the room. The API key and card details never reach the model.
+CrewKit Kitchen helps a student-club workshop organiser turn an attendee list into a complete supply order within a small approved budget. The organiser writes a brief: guests, budget, what each person needs. The AI chef searches Reap's catalogue, works out per-person and shared quantities, and requests a quote. Two server checks run before checkout: every mandatory quantity is covered, and the shipping-inclusive quote is within budget. If not, the chef swaps in cheaper products and keeps the requirements, or the brief is reported infeasible. When both pass, a QR code opens Reap's hosted approval page. When Reap reports the order COMPLETED, the Minecraft kitchen shows the order placed and plays the delivery and plating scene for each named guest. Minecraft is the shared display, so everyone can read the order's state. The API key and card details never reach the model.
 
 ## Problem
 
-Teams are starting to let agents spend money on workshop kits, offsites, and office supplies. Placing the order is easy. Trusting it is hard. A chat log does not show at a glance what the agent bought, whether it stayed in budget, who approved the payment, or whether the order actually went through. Event ops and finance leads need spend that is visible, capped, and approved by a person.
+The user is a student-club workshop organiser with an attendee list and a small approved budget. Turning that list into an order is tedious and error-prone: comparing products across listings, working out which items are per person and which are shared, adding shipping to the total, and forgetting items. A mistake means a second order or an over-budget one. An agent can do the legwork, but the organiser needs to check what it did without reading a chat log.
+
+> Organiser quote: "TODO: short testimonial from a workshop organiser." (TODO: name, club)
 
 ## Solution
 
-CrewKit turns an agent's purchase into a visible, step-by-step process with hard limits:
+CrewKit makes the agent's purchase a visible, step-by-step process with checks the model cannot skip:
 
-- A server-side budget gate that the model cannot bypass.
+- A requirements check: every mandatory quantity is covered.
+- A budget gate: the shipping-inclusive quote is within budget. Over-budget quotes cannot create a checkout through our tool.
+- Rework: the chef substitutes cheaper products and keeps the requirements. If nothing fits, the brief is reported infeasible.
 - Human approval on Reap's hosted page for every purchase.
-- A delivery scene that fires only when Reap reports `COMPLETED`.
-- A final record that compares budget, quoted total, and the amount actually charged.
+- A delivery scene that appears only when Reap reports `COMPLETED`. Order placed; delivery visualized. The sandbox ships nothing.
+- A final record that compares budget, quoted total, and the amount charged.
 
-The Minecraft kitchen is the interface. Each state (over budget, blocked, waiting for approval, delivered) has a distinct physical look, so anyone in the room can read the state of the spend without reading logs.
+The Minecraft kitchen is the shared visual interface. Each state (over budget, blocked, waiting for approval, order placed) has a distinct physical look.
+
+Demo honesty: hosted approval is a real human step on Reap's sandbox page. Simulated completion (`X-Simulate-Checkout: COMPLETED`) is a separate mode that skips approval and is labeled as simulated. We make no onchain claims.
 
 ## How Reap is used
 
@@ -70,3 +76,4 @@ Enrollment, quote, and checkout calls send an `Idempotency-Key`. The bill board 
 - Live demo / hosted page: `TODO`
 - Plan: https://mwvetbk1qiwd.postplan.dev
 - Team: `TODO`
+- Organiser testimonial: `TODO` (see the quote placeholder under Problem)
