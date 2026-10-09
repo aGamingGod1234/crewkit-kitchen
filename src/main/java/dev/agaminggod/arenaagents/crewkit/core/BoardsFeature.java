@@ -29,6 +29,7 @@ public final class BoardsFeature implements CrewkitFeature {
 	private static final float CART_SCALE = 3.4f;
 	private static final int MAX_ROLL_SOUNDS = 8;
 	private static final int STATUS_MAX = 30;
+	private static final int TYPE_CHARS_PER_TICK = 2;
 
 	private static final String[] ROW_LABELS = {"BUDGET", "QUOTED", "CHARGED", "VARIANCE", "ORDER"};
 
@@ -350,15 +351,32 @@ public final class BoardsFeature implements CrewkitFeature {
 				orderId == null ? "-" : clip(orderId, 18),
 		};
 		int[] colors = {CrewkitText.WHITE, CrewkitText.WHITE, CrewkitText.WHITE, verdict, CrewkitText.BLUE};
+		int at = 1;
 		for (int i = 0; i < values.length; i++) {
 			CrewkitDisplay value = rowValues[i];
-			String text = CrewkitText.of(values[i], colors[i], true);
+			String full = values[i];
+			int color = colors[i];
 			float rest = i == 4 ? 1.7f : 2.1f;
-			int at = 1 + i * 12;
-			// Stamp: swap in the text at 1.8x, then slam down to rest size; the sound lands with the slam.
-			CrewkitSchedule.after(at, () -> value.text(text).transform(rest * 1.8f, 0, 0, 0, 0));
-			CrewkitSchedule.after(at + 2, () -> value.transform(rest, 0, 0, 0, 3));
-			CrewkitSchedule.after(at + 4, () -> CrewkitSounds.play(server, value.pos(), "minecraft:ui.cartography_table.take_result", 1.0f, 1.0f));
+			CrewkitSchedule.after(at, () -> value.transform(rest, 0, 0, 0, 0));
+			// Typewriter: two characters per tick behind a cursor, a soft key click every few characters.
+			int steps = (full.length() + TYPE_CHARS_PER_TICK - 1) / TYPE_CHARS_PER_TICK;
+			for (int k = 1; k <= steps; k++) {
+				int shown = Math.min(full.length(), k * TYPE_CHARS_PER_TICK);
+				boolean done = shown == full.length();
+				String partial = done ? CrewkitText.of(full, color, true)
+						: CrewkitText.join(CrewkitText.of(full.substring(0, shown), color, true), CrewkitText.of("_", CrewkitText.MUTED, true));
+				boolean click = k % 2 == 1;
+				CrewkitSchedule.after(at + k, () -> {
+					value.text(partial);
+					if (click) CrewkitSounds.play(server, value.pos(), "minecraft:block.note_block.hat", 0.35f, 1.9f);
+				});
+			}
+			int end = at + steps;
+			// Then the stamp: a quick swell and settle, with the stamp sound on the settle.
+			CrewkitSchedule.after(end + 2, () -> value.transform(rest * 1.25f, 0, 0, 0, 2));
+			CrewkitSchedule.after(end + 4, () -> value.transform(rest, 0, 0, 0, 3));
+			CrewkitSchedule.after(end + 5, () -> CrewkitSounds.play(server, value.pos(), "minecraft:ui.cartography_table.take_result", 1.0f, 1.0f));
+			at = end + 9;
 		}
 	}
 

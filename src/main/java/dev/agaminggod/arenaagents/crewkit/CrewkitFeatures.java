@@ -20,6 +20,7 @@ public final class CrewkitFeatures {
 						new dev.agaminggod.arenaagents.crewkit.core.BoardsFeature(),
 						new dev.agaminggod.arenaagents.crewkit.items.ItemsFeature(),
 						new dev.agaminggod.arenaagents.crewkit.flow.FlowFeature(),
+						new dev.agaminggod.arenaagents.crewkit.flow.ReceiptFeature(),
 						new dev.agaminggod.arenaagents.crewkit.cast.CastFeature(),
 						new dev.agaminggod.arenaagents.crewkit.director.DirectorFeature(),
 					});

@@ -103,6 +103,12 @@ public final class FlowFeature implements CrewkitFeature {
 	private final List<MapId> qrMapIds = new ArrayList<>();
 	private final List<MapItemSavedData> qrMaps = new ArrayList<>();
 
+	/** Ghost copies of cart items on their destination plates: key = item + occurrence, value = live ghost. */
+	private final Map<String, Ghost> ghosts = new LinkedHashMap<>();
+	private static final double GHOST_SCALE = 0.35;
+
+	private record Ghost(String tag, String mcItem, Pos pos) {}
+
 	private static final class Line {
 		String mcItem;
 		String realName;
@@ -117,8 +123,8 @@ public final class FlowFeature implements CrewkitFeature {
 		if (data == null) data = new JsonObject();
 		switch (event) {
 			case "brief" -> onBrief(server, data);
-			case "item_added" -> onItemAdded(data);
-			case "item_removed" -> onItemRemoved(data);
+			case "item_added" -> { onItemAdded(data); refreshGhosts(server); }
+			case "item_removed" -> { onItemRemoved(data); refreshGhosts(server); }
 			case "gate_blocked" -> onGateBlocked(server, data);
 			case "gate_passed" -> onGatePassed(server, data);
 			case "checkout" -> onCheckout(server, data);
@@ -170,6 +176,7 @@ public final class FlowFeature implements CrewkitFeature {
 		platesSet = false;
 		delivered = false;
 		ledger.clear();
+		ghosts.clear();
 	}
 
 	// ---------------------------------------------------------------- brief
@@ -480,6 +487,8 @@ public final class FlowFeature implements CrewkitFeature {
 		if (!platesSet) setPlates(server);
 
 		List<DeliveryItem> items = collectDelivery();
+		Map<String, Ghost> pendingGhosts = new LinkedHashMap<>(ghosts);
+		ghosts.clear();
 		Pos door = rel(BAG[0] + 1.0, BAG[1] + 3.2, BAG[2]);
 		Pos floor = rel(BAG[0], BAG[1] + 0.45, BAG[2]);
 		long t = 6;
@@ -514,7 +523,12 @@ public final class FlowFeature implements CrewkitFeature {
 			} else {
 				targets.add(trayPos(server, wave.seats(), at));
 			}
-			for (int k = 0; k < targets.size(); k++) fly(server, wave.mcItem(), floor, targets.get(k), at + k);
+			for (int k = 0; k < targets.size(); k++) {
+				fly(server, wave.mcItem(), floor, targets.get(k), at + k);
+				Ghost g = takeGhost(pendingGhosts, wave.mcItem(), targets.get(k));
+				// The ghost fades just as the solid item lands on it: ghost = in cart, solid = paid.
+				if (g != null) later(at + k + 19, () -> fadeGhost(server, g));
+			}
 		}
 		int lineIndex = waves.size();
 		long end = start + Math.max(1, lineIndex) * 18L + 12;
@@ -525,6 +539,8 @@ public final class FlowFeature implements CrewkitFeature {
 			setTransform(server, "ck_flow_bag", scaleOnly(0.01), 8);
 		});
 		later(end + 9, () -> run(server, "kill @e[tag=ck_flow_bag]"));
+		// Anything the delivery did not land on (a line that changed shape) leaves with the bag.
+		later(end, () -> pendingGhosts.values().forEach(g -> fadeGhost(server, g)));
 		later(end + 16, () -> sound(server, "ui.toast.challenge_complete", rel(14.0, 4.0, 14.0), 0.7, 1.0));
 	}
 
@@ -544,16 +560,18 @@ public final class FlowFeature implements CrewkitFeature {
 		later(at + 21, () -> sound(server, "entity.item_frame.add_item", to, 0.8, 1.0));
 	}
 
-	private Pos trayPos(MinecraftServer server, List<Integer> seats, long at) {
+	private Pos trayCentre(List<Integer> seats) {
 		double x = 0, z = 0;
 		for (int s : seats) {
 			Pos p = platePos(s);
 			x += p.x;
 			z += p.z;
 		}
-		x /= seats.size();
-		z /= seats.size();
-		Pos tray = new Pos(x, CrewkitAnchors.origin.getY() + PLATE_Y, z);
+		return new Pos(x / seats.size(), CrewkitAnchors.origin.getY() + PLATE_Y, z / seats.size());
+	}
+
+	private Pos trayPos(MinecraftServer server, List<Integer> seats, long at) {
+		Pos tray = trayCentre(seats);
 		String tag = "ck_flow_tray_" + (itemSerial++);
 		double w = seats.size() == 2 ? 0.8 : 1.0;
 		later(Math.max(0, at - 4), () -> {
@@ -575,6 +593,10 @@ public final class FlowFeature implements CrewkitFeature {
 				LOGGER.warn("CrewKit delivery source failed, using flow ledger", e);
 			}
 		}
+		return ledgerDelivery();
+	}
+
+	private List<DeliveryItem> ledgerDelivery() {
 		List<DeliveryItem> out = new ArrayList<>();
 		for (Line line : ledger.values()) {
 			List<String> seats = line.seats;
@@ -590,6 +612,88 @@ public final class FlowFeature implements CrewkitFeature {
 			out.add(new DeliveryItem(line.mcItem, line.realName, List.copyOf(seats)));
 		}
 		return out;
+	}
+
+	// ---------------------------------------------------------------- ghosts
+
+	/** Where each cart item will be plated, using the same layout as delivery. Shared items sit on the tray spot. */
+	private Map<String, Pos> ghostTargets() {
+		Map<String, Pos> out = new LinkedHashMap<>();
+		int[] perSeatCount = new int[CrewkitAnchors.SEATS.length];
+		for (Wave wave : buildWaves(ledgerDelivery())) {
+			List<Pos> targets = new ArrayList<>();
+			if (wave.perPlate()) {
+				for (int s : wave.seats()) targets.add(plateSlot(s, perSeatCount[s]++));
+			} else if (wave.seats().isEmpty()) {
+				targets.add(rel(14.0, PLATE_Y, 13.0));
+			} else {
+				targets.add(trayCentre(wave.seats()).up(0.06));
+			}
+			for (Pos p : targets) {
+				int n = 0;
+				while (out.containsKey(wave.mcItem() + "#" + n)) n++;
+				out.put(wave.mcItem() + "#" + n, p);
+			}
+		}
+		return out;
+	}
+
+	/** Diff the ghost set against the cart: new ghosts grow in, moved ones glide, removed ones shrink away. */
+	private void refreshGhosts(MinecraftServer server) {
+		if (delivered || guests.isEmpty()) return;
+		Map<String, Pos> want = ghostTargets();
+		for (Iterator<Map.Entry<String, Ghost>> it = ghosts.entrySet().iterator(); it.hasNext(); ) {
+			Map.Entry<String, Ghost> e = it.next();
+			if (!want.containsKey(e.getKey())) {
+				fadeGhost(server, e.getValue());
+				it.remove();
+			}
+		}
+		int born = 0;
+		for (Map.Entry<String, Pos> e : want.entrySet()) {
+			Pos p = e.getValue().up(0.22);
+			Ghost old = ghosts.get(e.getKey());
+			if (old != null) {
+				if (Math.abs(old.pos().x - p.x) + Math.abs(old.pos().y - p.y) + Math.abs(old.pos().z - p.z) > 0.01) {
+					tp(server, old.tag(), p);
+					ghosts.put(e.getKey(), new Ghost(old.tag(), old.mcItem(), p));
+				}
+				continue;
+			}
+			String mcItem = e.getKey().substring(0, e.getKey().lastIndexOf('#'));
+			Ghost g = new Ghost("ck_flow_g_" + (itemSerial++), mcItem, p);
+			ghosts.put(e.getKey(), g);
+			// Dim, small and slightly see-through-looking: low light, no glow, ground mode.
+			run(server, "summon minecraft:item_display " + p + " {" + tags(g.tag(), "ck_flow_ghost")
+				+ ",item:{id:\"" + mcItem + "\",count:1},billboard:\"vertical\",teleport_duration:10,view_range:0.6f"
+				+ ",brightness:{sky:4,block:2},transformation:" + scaleOnly(0.01) + "}");
+			final int delay = 2 + Math.min(10, born++ / 2);
+			later(delay, () -> setTransform(server, g.tag(), scaleOnly(GHOST_SCALE), 6));
+		}
+		if (born > 0) sound(server, "block.amethyst_block.chime", rel(14.0, 3.0, 13.0), 0.35, 1.8);
+	}
+
+	private static Ghost takeGhost(Map<String, Ghost> pending, String mcItem, Pos target) {
+		Pos p = target.up(0.22);
+		String best = null;
+		double bestD = 0.05;
+		for (Map.Entry<String, Ghost> e : pending.entrySet()) {
+			Ghost g = e.getValue();
+			if (!g.mcItem().equals(mcItem)) continue;
+			double d = Math.abs(g.pos().x - p.x) + Math.abs(g.pos().y - p.y) + Math.abs(g.pos().z - p.z);
+			if (d < bestD) { bestD = d; best = e.getKey(); }
+		}
+		return best == null ? null : pending.remove(best);
+	}
+
+	private void fadeGhost(MinecraftServer server, Ghost g) {
+		setTransform(server, g.tag(), scaleOnly(0.01), 3);
+		later(4, () -> run(server, "kill @e[tag=" + g.tag() + "]"));
+	}
+
+	private void clearGhosts(MinecraftServer server) {
+		for (Ghost g : ghosts.values()) fadeGhost(server, g);
+		ghosts.clear();
 	}
 
 	/** One focal motion: either copies of a product to individual plates, or one shared item to a tray. */
@@ -648,6 +752,7 @@ public final class FlowFeature implements CrewkitFeature {
 
 	private void onFailed(MinecraftServer server, String event, JsonObject data) {
 		qrUrl = null;
+		clearGhosts(server);
 		clearQr(server, true);
 		String reason = str(data, "reason", str(data, "status", ""));
 		setTicket(server, PAPER, CrewkitText.failureLabel(event, str(data, "code", ""), reason), "#B91C1C");
