@@ -1,6 +1,6 @@
 # CrewKit set zones (v2, shell owner: set agent)
 
-Coordinates are relative to `CrewkitAnchors.origin` (the north-west floor corner). x runs east 0..27, z runs south 0..21, the floor is y=0 and you stand at y=1. The camera `ck_player` is at (14,5,21), looking north and 25 degrees down. The south side is open.
+Coordinates are relative to `CrewkitAnchors.origin` (the north-west floor corner). x runs east 0..27, z runs south 0..21, the floor is y=0 and you stand at y=1. The camera `ck_player` is at (14,5,19), inside the room, looking north and 25 degrees down. All four sides are closed. The south wall (z=21) is the front facade.
 
 ## Build order and teardown
 
@@ -40,6 +40,10 @@ The text sits inside those rectangles, including the timer and calls at about y 
 | Tables (unchanged) | A x 4..7, z 12..13. B x 12..15, z 12..13. C x 20..23, z 12..13. D x 8..11, z 16..17. E x 16..19, z 16..17. Dark oak top slab at y=1 plus white carpet at y=2. `SetBuilder.TABLE_TOP_Y = 2.0625` |
 | Seats | Spruce stairs at `CrewkitAnchors.SEATS` (y=1), with an open spruce trapdoor backrest at y=2 on the side away from the table |
 | Banners | Blue wall banners at (1,6,19) and (26,6,19) |
+
+| Front wall z=21 | White concrete, y 1..8. Spruce double door at x 13..14, y 1..2, in a stripped dark oak frame with a stone brick threshold. Glass-pane windows at x 4..8 and 19..23, y 3..5, with mullions at x=6 and 21 and a log header at y=6 |
+| Front interior z=20 | Pillars at x=11 and 16. Wainscot at x 3..10 and 17..24 (y 1..2, trapdoor cap at y=3). Crown moulding at y=6. Azaleas at (2,1,20) and (25,1,20) |
+| Front exterior z 22..25 | Brick skin at z=22 (x -1..28, y 1..7) with stone brick pilasters, window reveals and a deepslate tile eave. Stone brick path at x 13..14, z 23..25, with hanging lanterns at (12/15, 7, 23) and post lanterns at (12/15, 2, 25) |
 
 ## Left for KitchenDecor (empty in the shell)
 

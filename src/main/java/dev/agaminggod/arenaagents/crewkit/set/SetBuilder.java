@@ -29,7 +29,8 @@ import net.minecraft.world.phys.Vec3;
 
 /**
  * Places the CrewKit kitchen shell procedurally at {@link CrewkitAnchors#origin}; zones in docs/crewkit/SET-ZONES.md.
- * Relative coords: x east 0..27, z south 0..21, floor at y=0, beams at y=7, ceiling panels at y=8. South face open.
+ * Relative coords: x east 0..27, z south 0..21, floor at y=0, beams at y=7, ceiling panels at y=8. Closed on all four
+ * sides; the south wall (z=21) is the front facade with the entrance, and the camera sits inside at z=19.
  * After the shell, {@link KitchenDecor} and {@link Exterior} dress it.
  */
 public final class SetBuilder {
@@ -40,8 +41,8 @@ public final class SetBuilder {
 	public static final int ROOF = 8;
 	/** Foundation layer under the floor. */
 	static final int MIN_Y = -1;
-	/** Teardown snapshot box (relative): the footprint plus 6 blocks east, west and north for the exterior. */
-	static final int[] VOLUME = {-6, MIN_Y, -6, WIDTH - 1 + 6, 14, DEPTH - 1};
+	/** Teardown snapshot box (relative): the footprint plus 6 blocks east, west and north (exterior) and 4 south (entrance path). */
+	static final int[] VOLUME = {-6, MIN_Y, -6, WIDTH - 1 + 6, 14, DEPTH - 1 + 4};
 	/** Top surface of the table cloths (carpet on a top slab), relative to origin y. Plates sit here. */
 	public static final double TABLE_TOP_Y = 2.0625;
 	/** Entity tag on every marker this track spawns. Deliberately not "crewkit" so /crewkit reset keeps the anchors. */
@@ -252,7 +253,8 @@ public final class SetBuilder {
 
 	private static final class Placer {
 		// Back-wall pillars frame the boards; side pillars bracket the window bays.
-		private static final int[][] PILLARS = {{1, 1}, {11, 1}, {15, 1}, {1, 11}, {1, 17}, {1, 21}, {26, 11}, {26, 17}, {26, 21}};
+		private static final int[][] PILLARS = {{1, 1}, {11, 1}, {15, 1}, {1, 11}, {1, 17}, {26, 11}, {26, 17}, {11, 20}, {16, 20}};
+		private static final int[][] FRONT_WINDOWS = {{4, 8}, {19, 23}};
 		private static final int[] BEAMS_Z = {1, 5, 9, 13, 17, 21};
 		private static final int[] BEAMS_X = {1, 5, 9, 13, 14, 18, 22, 26};
 		private static final int[] COFFER_X = {3, 7, 11, 16, 20, 24};
@@ -291,6 +293,7 @@ public final class SetBuilder {
 			pillars();
 			boards();
 			windowsAndWainscot();
+			frontWall();
 			counterBase();
 			pass();
 			deliveryDoor();
@@ -318,9 +321,9 @@ public final class SetBuilder {
 			fill(0, 1, 0, WIDTH - 1, ROOF, 0, Blocks.WHITE_CONCRETE);
 			fill(0, 1, 0, 0, ROOF, DEPTH - 1, Blocks.WHITE_CONCRETE);
 			fill(WIDTH - 1, 1, 0, WIDTH - 1, ROOF, DEPTH - 1, Blocks.WHITE_CONCRETE);
-			// Front corner plants (plain azalea, no magenta).
-			set(2, 1, DEPTH - 1, Blocks.AZALEA);
-			set(WIDTH - 3, 1, DEPTH - 1, Blocks.AZALEA);
+			// Front corner plants (plain azalea, no magenta), just inside the front wall.
+			set(2, 1, DEPTH - 2, Blocks.AZALEA);
+			set(WIDTH - 3, 1, DEPTH - 2, Blocks.AZALEA);
 		}
 
 		private void ceiling() {
@@ -348,7 +351,7 @@ public final class SetBuilder {
 			}
 			// Crown moulding on the side walls (none on the back wall: it would cover the board displays).
 			for (int z = 2; z <= DEPTH - 2; z++) {
-				if (z == 11 || z == 17 || z == 19) continue;
+				if (z == 11 || z == 17 || z == 19) continue; // pillars and banners
 				set(1, 6, z, stairs(Blocks.SMOOTH_QUARTZ_STAIRS, Direction.WEST, Half.TOP));
 				set(WIDTH - 2, 6, z, stairs(Blocks.SMOOTH_QUARTZ_STAIRS, Direction.EAST, Half.TOP));
 			}
@@ -388,11 +391,87 @@ public final class SetBuilder {
 				}
 			}
 			BlockState cap = Blocks.SPRUCE_TRAPDOOR.defaultBlockState().setValue(BlockStateProperties.HALF, Half.BOTTOM);
-			int[][] runs = {{1, 12, 16}, {WIDTH - 2, 12, 16}, {WIDTH - 2, 18, 20}};
+			int[][] runs = {{1, 12, 16}, {WIDTH - 2, 12, 16}, {WIDTH - 2, 18, 19}};
 			for (int[] r : runs) {
 				fill(r[0], 1, r[1], r[0], 2, r[2], Blocks.STRIPPED_SPRUCE_WOOD);
 				fill(r[0], 3, r[1], r[0], 3, r[2], cap);
 			}
+		}
+
+		/** South wall z=21: entrance double door at x 13..14, two window bays, wainscot, moulding; brick facade and path outside. */
+		private void frontWall() {
+			int z = DEPTH - 1;
+			fill(0, 1, z, WIDTH - 1, ROOF, z, Blocks.WHITE_CONCRETE);
+			fill(0, 0, z, WIDTH - 1, 0, z, Blocks.SMOOTH_QUARTZ);
+			BlockState pane = Blocks.GLASS_PANE.defaultBlockState()
+					.setValue(BlockStateProperties.EAST, true)
+					.setValue(BlockStateProperties.WEST, true);
+			BlockState header = Blocks.STRIPPED_SPRUCE_LOG.defaultBlockState().setValue(BlockStateProperties.AXIS, Direction.Axis.X);
+			for (int[] w : FRONT_WINDOWS) {
+				int mullion = (w[0] + w[1]) / 2;
+				for (int x = w[0]; x <= w[1]; x++) {
+					fill(x, 3, z, x, 5, z, x == mullion ? Blocks.STRIPPED_SPRUCE_LOG.defaultBlockState() : pane);
+					set(x, 6, z, header);
+				}
+			}
+			// Entrance: stripped dark oak frame and lintel, spruce double door, blue runner leads to it.
+			fill(12, 1, z, 12, 3, z, Blocks.STRIPPED_DARK_OAK_LOG);
+			fill(15, 1, z, 15, 3, z, Blocks.STRIPPED_DARK_OAK_LOG);
+			fill(13, 3, z, 14, 3, z, Blocks.STRIPPED_DARK_OAK_LOG.defaultBlockState().setValue(BlockStateProperties.AXIS, Direction.Axis.X));
+			fill(13, 0, z, 14, 0, z, Blocks.STONE_BRICKS);
+			frontDoor(13, DoorHingeSide.LEFT);
+			frontDoor(14, DoorHingeSide.RIGHT);
+			// Interior face (z=20): wainscot either side of the entrance, crown moulding along the top.
+			BlockState cap = Blocks.SPRUCE_TRAPDOOR.defaultBlockState().setValue(BlockStateProperties.HALF, Half.BOTTOM);
+			for (int[] run : new int[][] {{3, 10}, {17, 24}}) {
+				fill(run[0], 1, z - 1, run[1], 2, z - 1, Blocks.STRIPPED_SPRUCE_WOOD);
+				fill(run[0], 3, z - 1, run[1], 3, z - 1, cap);
+			}
+			for (int x = 2; x <= WIDTH - 3; x++) {
+				if (x == 11 || x == 16) continue;
+				set(x, 6, z - 1, stairs(Blocks.SMOOTH_QUARTZ_STAIRS, Direction.SOUTH, Half.TOP));
+			}
+			// Outside (z=22): brick skin matching the exterior's other three faces, with reveals for the openings.
+			int o = z + 1;
+			fill(-1, 1, o, WIDTH, 7, o, Blocks.BRICKS);
+			fill(-1, 0, o, WIDTH, 0, o, Blocks.STONE_BRICKS);
+			for (int x : new int[] {-1, 0, 11, 16, WIDTH - 1, WIDTH}) fill(x, 1, o, x, 7, o, Blocks.STONE_BRICKS);
+			for (int[] w : FRONT_WINDOWS) {
+				fill(w[0], 3, o, w[1], 5, o, Blocks.AIR);
+				fill(w[0], 2, o, w[1], 2, o, Blocks.SMOOTH_STONE);
+				fill(w[0], 6, o, w[1], 6, o, Blocks.SMOOTH_STONE);
+			}
+			fill(13, 1, o, 14, 2, o, Blocks.AIR);
+			fill(13, 0, o, 14, 0, o, Blocks.STONE_BRICKS);
+			fill(-1, 8, o, WIDTH, 8, o, Blocks.DEEPSLATE_TILES);
+			BlockState eave = Blocks.DEEPSLATE_TILE_STAIRS.defaultBlockState()
+					.setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.NORTH)
+					.setValue(BlockStateProperties.HALF, Half.BOTTOM);
+			for (int x = -1; x <= WIDTH; x++) {
+				set(x, 9, o, Blocks.DEEPSLATE_TILE_SLAB.defaultBlockState());
+				set(x, 8, o + 1, eave);
+			}
+			// Short entrance path with two lanterns under the eave and two on posts at the end.
+			fill(13, 0, o + 1, 14, 0, o + 3, Blocks.STONE_BRICKS);
+			fill(12, 0, o + 1, 12, 0, o + 3, Blocks.POLISHED_ANDESITE);
+			fill(15, 0, o + 1, 15, 0, o + 3, Blocks.POLISHED_ANDESITE);
+			fill(12, 1, o + 1, 15, 7, o + 3, Blocks.AIR);
+			BlockState hanging = Blocks.LANTERN.defaultBlockState().setValue(BlockStateProperties.HANGING, true);
+			set(12, 7, o + 1, hanging);
+			set(15, 7, o + 1, hanging);
+			set(12, 1, o + 3, Blocks.SPRUCE_FENCE);
+			set(15, 1, o + 3, Blocks.SPRUCE_FENCE);
+			set(12, 2, o + 3, Blocks.LANTERN.defaultBlockState());
+			set(15, 2, o + 3, Blocks.LANTERN.defaultBlockState());
+		}
+
+		private void frontDoor(int x, DoorHingeSide hinge) {
+			BlockState base = Blocks.SPRUCE_DOOR.defaultBlockState()
+					.setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.NORTH)
+					.setValue(BlockStateProperties.DOOR_HINGE, hinge)
+					.setValue(BlockStateProperties.OPEN, false);
+			set(x, 1, DEPTH - 1, base.setValue(BlockStateProperties.DOUBLE_BLOCK_HALF, DoubleBlockHalf.LOWER));
+			set(x, 2, DEPTH - 1, base.setValue(BlockStateProperties.DOUBLE_BLOCK_HALF, DoubleBlockHalf.UPPER));
 		}
 
 		private void counterBase() {

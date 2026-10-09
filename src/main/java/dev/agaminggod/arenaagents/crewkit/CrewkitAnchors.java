@@ -16,7 +16,7 @@ public final class CrewkitAnchors {
 	public static final int[] AGENT = {8, 1, 6};
 	public static final int[] SCREEN = {9, 2, 8};
 	public static final int[] CRATE = {25, 1, 6};
-	public static final int[] PLAYER = {14, 5, 21};
+	public static final int[] PLAYER = {14, 5, 19};
 
 	public static net.minecraft.world.phys.Vec3 at(int[] rel) {
 		return new net.minecraft.world.phys.Vec3(origin.getX() + rel[0] + 0.5, origin.getY() + rel[1], origin.getZ() + rel[2] + 0.5);

@@ -22,7 +22,7 @@ public final class CrewkitMarks {
 		}
 	}
 
-	public static final Mark WIDE = new Mark("wide", "Wide: whole kitchen", 14.0, 5.6, 20.5, 14.0, 1.0, 9.5);
+	public static final Mark WIDE = new Mark("wide", "Wide: whole kitchen", 14.0, 5.6, 19.5, 14.0, 1.0, 9.5);
 	public static final Mark LINE = new Mark("line", "Counter line: chef and head stack", 11.0, 3.2, 10.8, 8.0, 2.2, 5.5);
 	public static final Mark BUDGET = new Mark("budget", "Budget board", 6.5, 4.2, 5.2, 6.5, 4.0, 0.5);
 	public static final Mark GATE = new Mark("gate", "The pass: ticket and gate bars", 9.5, 2.9, 13.5, 9.5, 2.2, 8.5);
