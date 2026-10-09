@@ -20,7 +20,7 @@ const { replayApi, recordingApi } = await import('../src/crewkit/tape.mjs');
 const { createEventStream } = await import('../src/crewkit/events.mjs');
 
 const SGD = (amount) => ({ amount, currency: 'SGD' });
-const budget = SGD(150);
+const budget = SGD(150); // unit tests; the demo brief itself is S$190
 const future = new Date(Date.now() + 10 * 60_000).toISOString();
 const totals = (amount, extra = {}) => ({ quoteId: 'q', total: SGD(amount), shipping: SGD(4), subtotal: SGD(amount - 4), expiresAt: future, ...extra });
 const names = (events) => events.map((e) => e.event).filter((e) => e !== 'calls');
@@ -95,14 +95,15 @@ test('replay emits the full contract sequence with one runId and gap-free seq', 
   assert.deepEqual(calls, calls.map((_, i) => i + 1));
   assert.equal(calls.at(-1), r.calls);
   const blocked = sent.find((p) => p.event === 'gate_blocked').data;
-  assert.deepEqual(blocked.over, SGD(46.6));
+  assert.deepEqual(blocked.over, SGD(60.45));
   const removed = sent.filter((p) => p.event === 'item_removed').map((p) => [p.data.id, p.data.qtyRemoved]);
-  assert.deepEqual(removed, [['cable', 6], ['notebook', 12]]);
+  assert.deepEqual(removed, [['notebook', 12], ['badge', 12]]);
   const swappedIn = sent.filter((p) => p.event === 'item_added').slice(-2).map((p) => [p.data.id, p.data.needId, p.data.qty]);
-  assert.deepEqual(swappedIn, [['cable-alt1', 'cable', 6], ['notebook-alt1', 'notebook', 12]], 'mandatory quantities kept');
+  assert.deepEqual(swappedIn, [['notebook-alt1', 'notebook', 12], ['badge-alt1', 'badge', 12]], 'mandatory quantities kept');
+  assert.ok(sent.filter((p) => p.event === 'item_added').every((p) => p.data.merchant === 'Popular Bookstore'), 'one merchant');
   assert.deepEqual(sent.find((p) => p.event === 'requirements').data, { ok: true, missing: [] });
   assert.equal(JSON.parse(readFileSync(r.files.jsonFile, 'utf8')).outcome, 'order placed');
-  assert.deepEqual(sent.find((p) => p.event === 'record').data, { budget: 150, quoted: 139, charged: 139, variance: 0, orderId: 'POP-SG-1048213', currency: 'SGD' });
+  assert.deepEqual(sent.find((p) => p.event === 'record').data, { budget: 190, quoted: 181.45, charged: 181.45, variance: 0, orderId: 'POP-SG-DEMO-0001', currency: 'SGD' });
   assert.ok(existsSync(r.files.jsonFile) && existsSync(r.files.csvFile) && existsSync(r.eventsFile));
   assert.equal(readFileSync(r.eventsFile, 'utf8').trim().split('\n').length, sent.length);
 });

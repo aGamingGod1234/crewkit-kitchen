@@ -20,8 +20,9 @@ if (existsSync(envFile)) {
 
 const BASE = process.env.REAP_BASE_URL || 'https://sg.sandbox.api.reap.global'; // canonical; sandbox.api.reap.global is an alias
 const VERSION = process.env.REAP_VERSION || '2025-02-14';
-const RETURN_URL = process.env.REAP_RETURN_URL || 'https://example.com/crewkit/done';
-const EMAIL = process.env.REAP_EMAIL || 'chef@crewkit.example';
+// Reap rejected example.com return URLs and .example emails (400 AGENTIC_REQUEST_REJECTED); this URL is accepted.
+const RETURN_URL = process.env.REAP_RETURN_URL || 'https://github.com/aGamingGod1234/crewkit-kitchen';
+const EMAIL = process.env.REAP_EMAIL || null; // must be a real-looking address; set REAP_EMAIL in .env
 
 // Venue, used as the delivery address for quotes.
 export const VENUE = {
@@ -84,11 +85,16 @@ export async function reap(method, path, body, { idempotent = false, idempotency
   }
 }
 
+function requireEmail() {
+  if (!EMAIL) throw new Error('REAP_EMAIL missing: add REAP_EMAIL=<real address> to coordinator/src/crewkit/.env');
+  return EMAIL;
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const safeJson = (t) => { try { return JSON.parse(t); } catch { return t; } };
 
 // ---- API wrappers (docs.reap.global/api-reference/agentic) ----
-export const createEnrollment = (ownerId = 'crewkit-demo', email = EMAIL) =>
+export const createEnrollment = (ownerId = 'crewkit-demo', email = requireEmail()) =>
   reap('POST', '/agentic/enrollments', {
     source: 'EXTERNAL',
     owner: { type: 'CLIENT_REFERENCE', id: ownerId, email },
@@ -117,7 +123,7 @@ export async function details(productIds) {
 }
 export const variant = (productId, optionIds) => reap('POST', '/agentic/products/variant', { productId, optionIds });
 
-export const createQuote = (items, { email = EMAIL, address = VENUE, merchants = [] } = {}) =>
+export const createQuote = (items, { email = requireEmail(), address = VENUE, merchants = [] } = {}) =>
   validateQuoteItems(items, merchants) && reap('POST', '/agentic/quotes', { items, email, shippingAddress: address }, { idempotent: true });
 export const getQuote = (id) => reap('GET', `/agentic/quotes/${id}`);
 export const selectShipping = (quoteId, shippingOptionId) =>
@@ -209,5 +215,6 @@ async function main([cmd, ...args]) {
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  main(process.argv.slice(2)).catch((e) => { console.error(e.message); if (e.detail) console.error(JSON.stringify(e.detail)); process.exit(1); });
+  // exitCode, not process.exit(): exiting with fetch handles open trips a libuv assertion on Windows.
+  main(process.argv.slice(2)).catch((e) => { console.error(e.message); if (e.detail) console.error(JSON.stringify(e.detail)); process.exitCode = 1; });
 }

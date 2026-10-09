@@ -1,21 +1,98 @@
 {
   "title": "Order ticket #001: Hackathon workshop kit",
   "guests": [
-    { "name": "James", "skin": null }, { "name": "John", "skin": null }, { "name": "Sandy", "skin": null },
-    { "name": "Priya", "skin": null }, { "name": "Wei Ling", "skin": null }, { "name": "Arjun", "skin": null },
-    { "name": "Mei", "skin": null }, { "name": "Daniel", "skin": null }, { "name": "Nurul", "skin": null },
-    { "name": "Ethan", "skin": null }, { "name": "Siti", "skin": null }, { "name": "Marcus", "skin": null }
+    {
+      "name": "James",
+      "skin": null
+    },
+    {
+      "name": "John",
+      "skin": null
+    },
+    {
+      "name": "Sandy",
+      "skin": null
+    },
+    {
+      "name": "Priya",
+      "skin": null
+    },
+    {
+      "name": "Wei Ling",
+      "skin": null
+    },
+    {
+      "name": "Arjun",
+      "skin": null
+    },
+    {
+      "name": "Mei",
+      "skin": null
+    },
+    {
+      "name": "Daniel",
+      "skin": null
+    },
+    {
+      "name": "Nurul",
+      "skin": null
+    },
+    {
+      "name": "Ethan",
+      "skin": null
+    },
+    {
+      "name": "Siti",
+      "skin": null
+    },
+    {
+      "name": "Marcus",
+      "skin": null
+    }
   ],
-  "budget": { "amount": 150, "currency": "SGD" },
+  "budget": {
+    "amount": 190,
+    "currency": "SGD"
+  },
   "merchant": "popular.com.sg",
   "needs": [
-    { "id": "badge", "label": "name badge", "query": "name badge holder", "per": "person" },
-    { "id": "notebook", "label": "notebook", "query": "A5 notebook", "per": "person" },
-    { "id": "pen", "label": "pen", "query": "gel pen", "per": "person" },
-    { "id": "cable", "label": "phone charging cable", "query": "usb-c charging cable", "per": "pair" }
+    {
+      "id": "badge",
+      "label": "name badge",
+      "query": "name badge holder",
+      "per": "person"
+    },
+    {
+      "id": "notebook",
+      "label": "notebook",
+      "query": "A5 notebook",
+      "per": "person"
+    },
+    {
+      "id": "pen",
+      "label": "pen",
+      "query": "gel pen",
+      "per": "person"
+    },
+    {
+      "id": "cable",
+      "label": "phone charging cable",
+      "query": "usb-c charging cable",
+      "per": "pair"
+    }
   ],
   "extras": [
-    { "id": "sticky_notes", "label": "sticky notes", "query": "post-it notes", "per": "room" },
-    { "id": "markers", "label": "whiteboard markers", "query": "whiteboard marker", "per": "room" }
+    {
+      "id": "sticky_notes",
+      "label": "sticky notes",
+      "query": "sticky notes",
+      "per": "room"
+    },
+    {
+      "id": "markers",
+      "label": "whiteboard markers",
+      "query": "whiteboard marker",
+      "per": "room"
+    }
   ]
 }

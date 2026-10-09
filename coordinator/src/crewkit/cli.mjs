@@ -15,7 +15,8 @@ const [cmd, briefPath] = args.filter((a, i) => !a.startsWith('--') && !(i > 0 &&
 async function main() {
   if (cmd !== 'run') {
     console.log('usage: node coordinator/src/crewkit/cli.mjs run [brief.json] --mode replay|simulate|live [--speed 1] [--tape file] [--post [url]] [--quiet]');
-    process.exit(cmd ? 1 : 0);
+    process.exitCode = cmd ? 1 : 0;
+    return;
   }
   const brief = JSON.parse(readFileSync(briefPath || DEFAULT_BRIEF, 'utf8'));
   const mode = flag('--mode', 'replay');
@@ -25,7 +26,8 @@ async function main() {
     const body = { brief, mode, ...(flag('--speed') ? { speed: Number(flag('--speed')) } : {}), ...(typeof flag('--tape') === 'string' ? { tape: flag('--tape') } : {}) };
     const res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
     console.log(res.status, await res.text());
-    process.exit(res.ok ? 0 : 1);
+    process.exitCode = res.ok ? 0 : 1;
+    return;
   }
   const quiet = flag('--quiet', false);
   const { runId, done } = await startRun(brief, {
@@ -40,7 +42,7 @@ async function main() {
   console.error(`[crewkit] ${r.status === 'COMPLETED' ? 'order placed' : r.status}${r.reason ? ` (${r.reason})` : ''} calls=${r.calls} events=${r.events.length}`);
   if (r.record) console.error(`[crewkit] record ${JSON.stringify(r.record)}`);
   for (const f of [r.eventsFile, r.files?.jsonFile, r.files?.csvFile, r.tapeFile].filter(Boolean)) console.error(`[crewkit] wrote ${f}`);
-  process.exit(r.status === 'COMPLETED' ? 0 : 2);
+  process.exitCode = r.status === 'COMPLETED' ? 0 : 2; // exitCode, not exit(): libuv assertion on Windows with fetch handles open
 }
 
-main().catch((e) => { console.error(`[crewkit] ${e.message}`); process.exit(1); });
+main().catch((e) => { console.error(`[crewkit] ${e.message}`); process.exitCode = 1; });

@@ -43,13 +43,16 @@ export const qtyFor = (per, guestCount, explicit) =>
 
 const needText = (n) => `${n.label} (${n.per === 'person' ? 'each' : n.per === 'pair' ? 'one per pair' : 'one for the room'}${n.optional ? ', optional extra' : ''})`;
 
-// Every available product in the brief currency from the one merchant, in Reap's relevance order.
-function pickable(products, currency, merchant) {
+// Every available, priced product in the brief currency, in Reap's relevance order.
+// Reap reports the display name ("Popular Bookstore"), not the domain we search with ("popular.com.sg"),
+// so the one-merchant rule locks onto the merchant name of the first product picked.
+function pickable(products, currency, lockedMerchant) {
   return (products || []).filter((p) => {
     if (p.available === false || p.previewVariant?.available === false) return false;
-    if (merchant && p.merchant?.name && p.merchant.name !== merchant) return false;
+    if (lockedMerchant && p.merchant?.name !== lockedMerchant) return false;
     const price = p.previewVariant?.price ?? p.priceRange?.min;
-    return !(price && typeof price === 'object' && price.currency && price.currency !== currency);
+    if (price && typeof price === 'object' && price.currency && price.currency !== currency) return false;
+    return toMoney(price, currency).amount > 0; // free gifts and unpriced listings are never part of a kit
   }).map((p) => ({
     productId: p.id, variantId: p.previewVariant?.id ?? null, realName: p.name, merchant: p.merchant?.name || merchant || 'unknown',
     unitPrice: toMoney(p.previewVariant?.price ?? p.priceRange?.min, currency),
@@ -88,6 +91,7 @@ export async function runCrewkit({ brief: rawBrief, api, emit, enrollmentId, pol
   // 1. Search; pick Reap's top result per need and keep the other results as permitted substitutes.
   const names = brief.guests.map((g) => g.name);
   const required = (n) => qtyFor(n.per, guestCount, n.qty);
+  let lockedMerchant = null;
   const resolveVariant = async (p) => {
     if (p.variantId) return p;
     const d = await call('details', [p.productId]);
@@ -114,11 +118,15 @@ export async function runCrewkit({ brief: rawBrief, api, emit, enrollmentId, pol
     let options = [];
     for (const query of need.queries) {
       const res = await call('search', query, { merchant: brief.merchant || undefined, mode: 'ONLY', limit: 10, country: brief.country, currency: cur });
-      options = pickable(res?.products, cur, brief.merchant);
+      options = pickable(res?.products, cur, lockedMerchant);
       if (options.length) break;
     }
     let first = null;
     while (options.length && !first) first = await resolveVariant(options.shift());
+    if (first) lockedMerchant ??= first.merchant;
+    // A permitted substitute must still be the same kind of thing: its name shares a word with the need.
+    const words = [need.label, ...need.queries].join(' ').toLowerCase().match(/[a-z0-9]{3,}/g) || [];
+    options = options.filter((o) => words.some((w) => o.realName.toLowerCase().includes(w)));
     if (!first) {
       if (need.optional) { log(`no product for optional extra ${need.id}, skipped`); continue; }
       return fail('failed', 'BRIEF_INFEASIBLE', `No available ${cur} product for "${need.label}" at ${brief.merchant || 'any merchant'}`);

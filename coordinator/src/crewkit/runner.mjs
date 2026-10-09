@@ -67,6 +67,7 @@ export async function startRun(rawBrief, { mode = 'replay', sinks = [], tape = D
   } else {
     if (!process.env.REAP_API_KEY) await import('./reap-client.mjs'); // loads .env
     if (!process.env.REAP_API_KEY) throw new Error('REAP_API_KEY missing in coordinator/src/crewkit/.env');
+    if (!process.env.REAP_EMAIL) throw new Error('REAP_EMAIL missing in coordinator/src/crewkit/.env (quotes need a real-looking email)');
     enrollmentId = resolveEnrollmentId(brief);
     if (!enrollmentId) throw new Error('No ACTIVE enrollment id: run `node coordinator/src/crewkit/reap-client.mjs enroll`, add a test card, or set REAP_ENROLLMENT_ID');
     api = await liveApi({ simulate: mode === 'simulate' });
