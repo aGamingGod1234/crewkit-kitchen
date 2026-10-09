@@ -31,6 +31,7 @@ public final class CrewkitFeatures {
 						new dev.agaminggod.arenaagents.crewkit.fun.chaos.KitchenChaosFeature(),
 						new dev.agaminggod.arenaagents.crewkit.fun.music.LobbyMusicFeature(),
 						new dev.agaminggod.arenaagents.crewkit.fun.printer.ReceiptPrinterFeature(),
+						new dev.agaminggod.arenaagents.crewkit.fun.bubble.ChefBubbleFeature(),
 						new dev.agaminggod.arenaagents.crewkit.director.DirectorFeature(),
 					});
 				}
