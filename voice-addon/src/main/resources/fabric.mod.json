@@ -4,7 +4,7 @@
 	"version": "${version}",
 	"name": "Arena Agents Voice",
 	"description": "Optional spatial voice transport for Arena Agents using Simple Voice Chat.",
-	"license": "All-Rights-Reserved",
+	"license": "MIT",
 	"environment": "*",
 	"entrypoints": {
 		"arenaagents_voice": [

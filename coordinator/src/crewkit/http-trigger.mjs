@@ -54,6 +54,11 @@ export function startCrewkitHttp({ controller, port = Number(process.env.CREWKIT
   const send = (res, status, obj) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
   const server = createServer(async (req, res) => {
     try {
+      // Browsers attach Origin to cross-site requests and can only send JSON after a preflight we never answer,
+      // so requiring both keeps any web page open on this machine from starting or resetting a run.
+      if (req.method === 'POST' && (req.headers.origin || !String(req.headers['content-type'] || '').startsWith('application/json'))) {
+        return send(res, 403, { error: 'POST needs content-type application/json and no Origin header' });
+      }
       if (req.method === 'POST' && req.url === '/crewkit/run') {
         const body = await readJson(req);
         const run = await controller.start(body.brief, { mode: body.mode || 'replay', speed: body.speed, tape: body.tape });
