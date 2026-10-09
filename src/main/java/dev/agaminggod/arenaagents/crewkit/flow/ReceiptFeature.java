@@ -4,7 +4,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.crewkit.CrewkitAnchors;
 import dev.agaminggod.arenaagents.crewkit.CrewkitFeature;
-import dev.agaminggod.arenaagents.crewkit.core.CrewkitDisplays;
+import dev.agaminggod.arenaagents.crewkit.core.CrewkitDispatcher;
 import dev.agaminggod.arenaagents.crewkit.core.CrewkitSchedule;
 import dev.agaminggod.arenaagents.crewkit.core.CrewkitSounds;
 import dev.agaminggod.arenaagents.crewkit.core.CrewkitText;
@@ -101,13 +101,13 @@ public final class ReceiptFeature implements CrewkitFeature {
 		CrewkitSchedule.after(20, () -> {
 			if (near.isEmpty()) {
 				Vec3 pass = new Vec3(CrewkitAnchors.origin.getX() + 7.5, CrewkitAnchors.origin.getY() + 2.3, CrewkitAnchors.origin.getZ() + 9.9);
-				CrewkitDisplays.run(server, String.format(Locale.ROOT, "summon minecraft:item %.3f %.3f %.3f {Tags:[\"crewkit\",\"ck_receipt\"],PickupDelay:10s,Motion:[0d,0.15d,0.1d],Item:{id:\"minecraft:written_book\",count:1,components:{\"minecraft:written_book_content\":%s}}}",
+				runLogged(server, String.format(Locale.ROOT, "summon minecraft:item %.3f %.3f %.3f {Tags:[\"crewkit\",\"ck_receipt\"],PickupDelay:10s,Motion:[0d,0.15d,0.1d],Item:{id:\"minecraft:written_book\",count:1,components:{\"minecraft:written_book_content\":%s}}}",
 					pass.x, pass.y, pass.z, bookSnbt(cur, budget, charged, variance, orderId)));
 				CrewkitSounds.play(server, pass, "minecraft:item.book.page_turn", 1.0f, 1.0f);
 				return;
 			}
 			for (ServerPlayer p : near) {
-				CrewkitDisplays.run(server, "give " + p.getStringUUID() + " " + item);
+				runLogged(server, "give " + p.getScoreboardName() + " " + item);
 				CrewkitSounds.play(server, p.position(), "minecraft:item.book.page_turn", 1.0f, 1.0f);
 			}
 		});
@@ -142,6 +142,19 @@ public final class ReceiptFeature implements CrewkitFeature {
 			sb.append('"').append(CrewkitText.escape(pages.get(i))).append('"');
 		}
 		return sb.append("]}").toString();
+	}
+
+	private static void runLogged(MinecraftServer server, String command) {
+		// Parse errors never reach a callback, so report through a source that logs failures.
+		net.minecraft.commands.CommandSource log = new net.minecraft.commands.CommandSource() {
+			@Override public void sendSystemMessage(net.minecraft.network.chat.Component message) {
+				CrewkitDispatcher.LOGGER.warn("CrewKit receipt: {} ({})", message.getString(), command.substring(0, Math.min(80, command.length())));
+			}
+			@Override public boolean acceptsSuccess() { return false; }
+			@Override public boolean acceptsFailure() { return true; }
+			@Override public boolean shouldInformAdmins() { return false; }
+		};
+		server.getCommands().performPrefixedCommand(server.createCommandSourceStack().withLevel(server.overworld()).withSource(log), command);
 	}
 
 	private static String clip(String s, int max) {

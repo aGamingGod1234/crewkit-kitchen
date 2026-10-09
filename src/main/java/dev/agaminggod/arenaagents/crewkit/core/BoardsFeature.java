@@ -363,8 +363,11 @@ public final class BoardsFeature implements CrewkitFeature {
 			for (int k = 1; k <= steps; k++) {
 				int shown = Math.min(full.length(), k * TYPE_CHARS_PER_TICK);
 				boolean done = shown == full.length();
-				String partial = done ? CrewkitText.of(full, color, true)
-						: CrewkitText.join(CrewkitText.of(full.substring(0, shown), color, true), CrewkitText.of("_", CrewkitText.MUTED, true));
+				// Always one compound with an explicit extra list: data merge replaces lists but merges compounds,
+				// so the cursor from the previous step must be overwritten, not left behind.
+				String body = CrewkitText.of(full.substring(0, shown), color, true);
+				String partial = body.substring(0, body.length() - 1)
+						+ ",extra:[" + (done ? "{text:\"\"}" : CrewkitText.of("_", CrewkitText.MUTED, true)) + "]}";
 				boolean click = k % 2 == 1;
 				CrewkitSchedule.after(at + k, () -> {
 					value.text(partial);

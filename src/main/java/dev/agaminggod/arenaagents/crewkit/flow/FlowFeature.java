@@ -574,7 +574,7 @@ public final class FlowFeature implements CrewkitFeature {
 		int[] total = new int[CrewkitAnchors.SEATS.length];
 		for (Wave w : waves) if (w.perPlate()) for (int s : w.seats()) total[s]++;
 		int[] used = new int[CrewkitAnchors.SEATS.length];
-		Map<String, Integer> traysAt = new LinkedHashMap<>();
+		Map<String, List<Double>> traysAt = new LinkedHashMap<>();
 		List<List<Placement>> out = new ArrayList<>();
 		for (Wave w : waves) {
 			List<Placement> list = new ArrayList<>();
@@ -593,16 +593,31 @@ public final class FlowFeature implements CrewkitFeature {
 					}
 					x = sx / n;
 				}
-				// Several trays on one table spread along its long axis instead of stacking.
-				int nth = traysAt.merge(table[0] + "," + table[1], 1, Integer::sum) - 1;
-				x += (nth % 2 == 1 ? 1 : -1) * ((nth + 1) / 2) * (width + 0.15);
-				x = Math.max(table[0] + width / 2 + 0.05, Math.min(table[0] + TABLE_W - width / 2 - 0.05, x));
+				// Trays sit on the cloth between the end plates (x0+0.85..x0+3.15). Table B's candle cake
+				// (KitchenDecor) takes x0+2..x0+3 of the centre line, so trays there stay west of it.
+				double lo = table[0] + 0.85 + width / 2;
+				double hi = table[0] + (table == TABLES[1] ? 2.0 : 3.15) - width / 2;
+				List<Double> taken = traysAt.computeIfAbsent(table[0] + "," + table[1], k -> new ArrayList<>());
+				x = freeSpot(Math.max(lo, Math.min(hi, x)), lo, hi, width, taken);
+				taken.add(x);
 				Pos tray = rel(x, PLATE_Y, table[1] + TABLE_D / 2.0);
 				list.add(new Placement(tray.up(TRAY_H + ITEM_LIFT), tray, width));
 			}
 			out.add(list);
 		}
 		return out;
+	}
+
+	/** Nearest x in [lo, hi] whose tray of {@code width} clears every tray already on the table; else the start. */
+	private static double freeSpot(double start, double lo, double hi, double width, List<Double> taken) {
+		for (int step = 0; step <= 40; step++) {
+			double x = start + (step % 2 == 1 ? 1 : -1) * ((step + 1) / 2) * 0.1;
+			if (x < lo - 1e-6 || x > hi + 1e-6) continue;
+			boolean clear = true;
+			for (double t : taken) if (Math.abs(t - x) < width + 0.08) clear = false;
+			if (clear) return x;
+		}
+		return start;
 	}
 
 	/** Table cell (min corner) under a seat's plate; mirrors SetBuilder.TABLES. */
