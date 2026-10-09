@@ -19,9 +19,13 @@ export function createCrewkitController({ sink = () => {}, log = () => {} } = {}
     async start(brief, { mode = 'replay', speed, tape } = {}) {
       if (!MODES.includes(mode)) { const e = new Error(`mode must be one of ${MODES.join(', ')}`); e.status = 400; throw e; }
       if (active) { const e = new Error(`CrewKit run ${active.runId} is still in progress`); e.status = 409; throw e; }
-      const run = await startRun(brief ?? JSON.parse(readFileSync(DEFAULT_BRIEF, 'utf8')), {
-        mode, sinks: [sink], log, ...(speed !== undefined ? { speed: Number(speed) } : {}), ...(typeof tape === 'string' && tape.endsWith('.tape.json') ? { tape } : {}),
-      });
+      active = { runId: 'starting', mode, startedAt: Date.now() }; // claim the slot before any await
+      let run;
+      try {
+        run = await startRun(brief ?? JSON.parse(readFileSync(DEFAULT_BRIEF, 'utf8')), {
+          mode, sinks: [sink], log, ...(speed !== undefined ? { speed: Number(speed) } : {}), ...(typeof tape === 'string' && tape.endsWith('.tape.json') ? { tape } : {}),
+        });
+      } catch (e) { active = null; e.status ??= 400; throw e; }
       active = { runId: run.runId, mode, startedAt: Date.now() };
       run.done.then((r) => {
         last = { runId: run.runId, mode, status: r.status, reason: r.reason ?? null, record: r.record ?? null, calls: r.calls, approvalUrl: r.checkout?.approvalUrl ?? null };
