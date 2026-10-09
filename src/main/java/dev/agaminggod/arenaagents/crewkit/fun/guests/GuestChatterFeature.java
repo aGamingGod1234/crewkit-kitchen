@@ -26,11 +26,11 @@ import net.minecraft.world.phys.Vec3;
 public final class GuestChatterFeature implements CrewkitFeature {
 	private static final String TAG = "ck_guest_chat";
 	private static final int BUBBLE_TICKS = 60;
-	private static final int MAX_BUBBLES = 2;
-	private static final int MIN_GAP_TICKS = 100;
-	private static final int GAP_SPREAD_TICKS = 60;
+	private static final int MAX_BUBBLES = 1;
+	private static final int MIN_GAP_TICKS = 220;
+	private static final int GAP_SPREAD_TICKS = 120;
 	/** Reactive lines can jump the idle queue, but not more often than this, so an activity burst stays readable. */
-	private static final int REACT_COOLDOWN_TICKS = 30;
+	private static final int REACT_COOLDOWN_TICKS = 120;
 	private static final float BUBBLE_SCALE = 0.8f;
 	private static final double BUBBLE_HEIGHT = 2.45;
 

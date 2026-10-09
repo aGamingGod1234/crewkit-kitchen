@@ -89,7 +89,7 @@ public final class ReceiptPrinterFeature implements CrewkitFeature {
 			String stamp = stamp(result);
 			text = CrewkitText.join(head, price, stamp);
 			queuePrint(server, text, 0.42f, true, result);
-		} else if ("probe".equals(kind) || "search".equals(kind)) {
+		} else if (false && ("probe".equals(kind) || "search".equals(kind))) { // quotes only: stock slips were too noisy on camera
 			String name = str(data, "realName", "");
 			if (name.isEmpty()) name = str(data, "text", "item");
 			if (name.length() > 20) name = name.substring(0, 19) + "…";
