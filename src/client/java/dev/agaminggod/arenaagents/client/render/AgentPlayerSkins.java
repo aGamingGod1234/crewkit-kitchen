@@ -57,7 +57,9 @@ public final class AgentPlayerSkins {
 	 * and it is resolved per call so assigning the chef mid-session re-skins the body at once.
 	 */
 	private static Optional<PlayerSkin> crewkitChef(String name) {
-		var level = Minecraft.getInstance().level;
+		// getInstance() is null before the client boots (skin lookups can run from verifiers and early UI).
+		Minecraft minecraft = Minecraft.getInstance();
+		var level = minecraft == null ? null : minecraft.level;
 		if (level == null || name == null) return Optional.empty();
 		var team = level.getScoreboard().getPlayersTeam(name);
 		if (team == null || !team.getName().equals(AgentVisualIdentity.CREWKIT_CHEF_SKIN)) return Optional.empty();
