@@ -448,6 +448,17 @@ public final class SetBuilder {
 						Blocks.DARK_OAK_SLAB.defaultBlockState().setValue(BlockStateProperties.SLAB_TYPE, SlabType.TOP));
 				fill(t[0], 2, t[1], t[0] + 3, 2, t[1] + 1, Blocks.WHITE_CARPET);
 			}
+			// Light grey rug ring around tables A-C on the free cells (seats and tables keep their own blocks).
+			for (int i = 0; i < 3; i++) {
+				int[] t = TABLES[i];
+				for (int x = t[0] - 1; x <= t[0] + 4; x++) {
+					for (int z = t[1] - 1; z <= t[1] + 2; z++) {
+						boolean edgeColumn = x == t[0] - 1 || x == t[0] + 4;
+						boolean middleOfLongSide = (z == t[1] - 1 || z == t[1] + 2) && (x == t[0] + 1 || x == t[0] + 2);
+						if (edgeColumn || middleOfLongSide) set(x, 1, z, Blocks.LIGHT_GRAY_CARPET);
+					}
+				}
+			}
 			// Seats from CrewkitAnchors.SEATS: spruce stair plus a trapdoor backrest behind the sitter.
 			// facing 0 = sitter faces south (stair back north); an open trapdoor facing F has its panel on the side opposite F.
 			for (double[] seat : CrewkitAnchors.SEATS) {

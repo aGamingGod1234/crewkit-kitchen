@@ -27,7 +27,7 @@ The text sits inside those rectangles, including the timer and calls at about y 
 | Element | Cells |
 |---|---|
 | Floor y=0 | Border (x≤1, x≥26, z≤1, z≥20): smooth quartz. Kitchen z 2..9: polished tuff. Divider z=10: smooth quartz. Dining z 11..19: polished blackstone. Door threshold (26..27, 0, 5..6): stone bricks |
-| Rugs y=1 | Blue carpet runner on the centre aisle x 13..14, z 15..20 |
+| Rugs y=1 | Blue carpet runner on the centre aisle x 13..14, z 15..20. Light grey rug rings around tables A-C: columns x0-1 and x0+4 for z 11..14, plus the two middle cells of the z=11 and z=14 rows (A x0=4, B x0=12, C x0=20) |
 | Back wall z=0 y 1..8 | White concrete. Budget backing x 2..10, y 2..6: blue concrete. Bill backing x 16..26, y 2..6: black concrete. Dark oak log sill at y=1 and header at y=7 over both boards. Dark oak log column at (26, 1..7, 0) |
 | Board lips z=1 | Dark oak bottom slab at y=1 (x 2..10 and 16..25). Closed top dark oak trapdoor at y=6 (same x) |
 | Pillars | Quartz pillars with chiseled quartz base (y=1) and capital (y=6), x/z = (1,1) (11,1) (15,1) / side (1,11) (1,17) (1,21) (26,11) (26,17) (26,21) |
