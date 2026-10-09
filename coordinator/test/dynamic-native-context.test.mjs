@@ -1519,6 +1519,46 @@ test('a detected movement loop steers once until movement escapes and a new loop
 	} finally { release(); await run.coordinator.stop(); }
 });
 
+test('a movement loop seen only in action progress positions steers once and asks the server for an observation', async () => {
+	let release;
+	const gate = new Promise(resolve => { release = resolve; });
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	const steers = [];
+	planner.requestNativeTurn = async request => { planner.requests.push(request); await gate; return { status: 'completed', toolCalls: 0 }; };
+	planner.steerNativeTurn = async request => { steers.push(request); return { turnId: 'thinking' }; };
+	const run = await start({ registry, planner, config: {
+		bridge: { port: 25570, secret: 's'.repeat(32) },
+		codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+	} });
+	const progress = async x => {
+		run.bridge.emit('action_progress', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: 'walk-1', state: 'RUNNING', progress: 0.5, elapsedMs: 100, observedAtEpochMs: 1,
+			actionObservation: { observedAtEpochMs: 1, position: { x, y: 64, z: 0 } } } });
+		await new Promise(resolve => setImmediate(resolve));
+	};
+	const observationRequests = () => run.bridge.sent.filter(message => message.type === 'request_observation').length;
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Find a tree.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, attention: false,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => planner.requests.length === 1);
+		for (const x of [1, 0]) await progress(x);
+		assert.equal(observationRequests(), 0, 'three samples are not a loop yet');
+		await progress(1);
+		await eventually(() => observationRequests() === 1);
+		for (const x of [0, 1, 0, 1]) await progress(x);
+		assert.equal(observationRequests(), 1, 'one unresolved loop asks once');
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 2, attention: false,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => steers.length === 1);
+		assert.match(steers[0].input, /movement_loop/);
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 3, attention: false,
+			observation: { player: { x: 1, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		for (let index = 0; index < 5; index += 1) await new Promise(resolve => setImmediate(resolve));
+		assert.equal(steers.length, 1, 'the observation that follows does not report the same loop again');
+	} finally { release(); await run.coordinator.stop(); }
+});
+
 test('new resource observations coalesce behind an active model turn without interrupting it', async () => {
 	let release;
 	const gate = new Promise(resolve => { release = resolve; });

@@ -233,7 +233,6 @@ public final class ServerObservationCollector {
 		observation.add("lastResult", lastResult(agentId));
 		observation.add("perception", PlayerObservationEvents.snapshot(agent));
 		observation.add("coverage", ObservationPage.coverage(observation));
-		ObservationBlockTags.compact(observation);
 		return observation;
 	}
 

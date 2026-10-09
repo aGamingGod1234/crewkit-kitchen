@@ -2357,6 +2357,7 @@ test('fragmented registry waits for completion and preserves every long UTF-8 qu
 	assert.equal(hello.payload.registryFragments, true);
 	// Java sends action clocks only to a coordinator that announces this; an older one rejects the unknown keys.
 	assert.equal(hello.payload.actionTiming, true);
+	assert.equal(hello.payload.blockTags, true, 'the hello announces the block tag dictionary so the server may send it');
 	const record = largeQueuedRecord();
 	assert.ok(Buffer.byteLength(JSON.stringify(record)) > 65_536);
 	const completed = once(bridge, 'ready');
@@ -2554,4 +2555,11 @@ test('an observation embedded in an inspection result gets its block tags back t
 	assert.equal(result.result.eventSequence, 9, 'the rest of the result is untouched');
 	const plain = validateProtocolV2Payload('inspection_result', { goalRevision: 4, requestId: 'req-2', result: { section: 'inventory', entries: [] } });
 	assert.deepEqual(plain.result, { section: 'inventory', entries: [] });
+});
+
+test('the hello may announce blockTags, and only as a boolean; a server that predates it sees the same hello without it', () => {
+	const hello = { replyTo: 'auth-1', clientNonce: 'c'.repeat(43), serverNonce: 's'.repeat(43), proof: 'p'.repeat(43) };
+	assert.equal(validateProtocolV2Payload('hello', { ...hello, blockTags: true }).blockTags, true);
+	assert.equal(validateProtocolV2Payload('hello', hello).blockTags, undefined, 'omitting it stays valid');
+	assert.throws(() => validateProtocolV2Payload('hello', { ...hello, blockTags: 'yes' }), ProtocolV2Error);
 });

@@ -122,6 +122,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyRespawnContinuationPayload();
 		verifyVerboseControlRetriesAfterBackpressure();
 		verifyVerboseTelemetryCannotSuppressProgress();
+		verifyBlockTagCapability();
 		assertEquals(true, MultiplexedServerBridge.HANDSHAKE_RETRY_WAIT_MS > 0L,
 				"hello retries wait instead of spinning when the registry snapshot moves");
 		List<AgentRecord> registered = new ArrayList<>();
@@ -215,7 +216,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyPendingRegistrationMarkerIsFenced();
 		verifyAtomicPublicationRacesSessionClose();
 		verifyObservationWriterRacesSessionClose();
-		return 368;
+		return 374;
 	}
 
 	@SuppressWarnings("unchecked")
@@ -1558,6 +1559,36 @@ public final class MultiplexedServerBridgeVerification {
 				}
 			}
 		}
+	}
+
+	/** Tags are listed once per block type only for a coordinator whose hello announced it; an older one keeps them inline. */
+	private static void verifyBlockTagCapability() {
+		JsonObject hello = new JsonObject();
+		assertEquals(false, MultiplexedServerBridge.announcedCapability(hello, "blockTags"), "a coordinator that predates blockTags announces nothing");
+		hello.addProperty("blockTags", true);
+		assertEquals(true, MultiplexedServerBridge.announcedCapability(hello, "blockTags"), "the hello announces blockTags");
+		hello.addProperty("blockTags", false);
+		assertEquals(false, MultiplexedServerBridge.announcedCapability(hello, "blockTags"), "the hello may decline blockTags");
+		hello.addProperty("blockTags", "yes");
+		assertThrowsBridgeCode(() -> MultiplexedServerBridge.announcedCapability(hello, "blockTags"), "INVALID_FIELD", "blockTags must be a boolean");
+		JsonObject observation = new JsonObject();
+		JsonArray blocks = new JsonArray();
+		for (int index = 0; index < 2; index++) {
+			JsonObject row = new JsonObject();
+			row.addProperty("blockId", "minecraft:stone");
+			row.addProperty("x", index);
+			JsonArray tags = new JsonArray();
+			tags.add("minecraft:mineable/pickaxe");
+			row.add("tags", tags);
+			blocks.add(row);
+		}
+		observation.add("blocks", blocks);
+		JsonObject inline = observation.deepCopy();
+		JsonObject compact = MultiplexedServerBridge.forSession(observation.deepCopy(), true);
+		assertTrue(compact.has("blockTags") && !compact.getAsJsonArray("blocks").get(0).getAsJsonObject().has("tags"),
+				"a coordinator that announced blockTags gets the dictionary");
+		assertEquals(inline, MultiplexedServerBridge.forSession(observation.deepCopy(), false),
+				"a coordinator that did not announce blockTags gets every tag inline, as before");
 	}
 
 	private static void verifyVerboseTelemetryCannotSuppressProgress() {

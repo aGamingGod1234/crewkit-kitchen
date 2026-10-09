@@ -1059,8 +1059,13 @@ export class DynamicCoordinator extends EventEmitter {
 			});
 		});
 		this.#listen('action_progress', (message, connectionEpoch) => {
+			const lifecycleGeneration = this.#lifecycleGeneration(message.agentId);
 			return this.#enqueueAgent(message.agentId, async () => {
 				const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
+				if (this.#usesNativeTools(record) && message.payload.actionObservation?.position !== undefined
+					&& this.#isLifecycleGenerationCurrent(message.agentId, lifecycleGeneration)) {
+					this.#sampleProgressMovement(record, lifecycleGeneration, connectionEpoch, message.payload.actionObservation.position);
+				}
 				const nativeWork = this.#providerWork.get(message.agentId);
 				if (this.#usesNativeTools(record) && nativeWork?.goalRevision === record.goalRevision) {
 					this.#goalSupervisor.progress(nativeWork.supervisionToken);
@@ -1408,38 +1413,46 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	#rememberNativeWorldSignals(record, lifecycleGeneration, connectionEpoch, observation) {
-		const previous = this.#nativeWorldSignals.get(record.agentId);
-		const sameLifecycle = previous?.goalRevision === record.goalRevision
-			&& previous.lifecycleGeneration === lifecycleGeneration
-			&& previous.connectionEpoch === connectionEpoch;
-		const state = sameLifecycle
-			? previous
-			: { goalRevision: record.goalRevision, lifecycleGeneration, connectionEpoch, positions: [], resources: new Set() };
-		const positionKey = nativeBlockPositionKey(observation?.player);
-		const previousPositionKey = state.positions.at(-1);
-		if (positionKey !== null && positionKey !== previousPositionKey) {
-			state.positions.push(positionKey);
-			if (state.positions.length > MAX_NATIVE_MOVEMENT_HISTORY) state.positions.shift();
-		}
+		const state = this.#nativeWorldState(record, lifecycleGeneration, connectionEpoch);
+		const movementLoop = sampleMovement(state, nativeBlockPositionKey(observation?.player));
 		let resourceDiscovery = false;
 		for (const candidate of observedResourceCandidates(observation)) {
 			if (!state.resources.has(candidate)) resourceDiscovery = true;
 			state.resources.add(candidate);
 		}
 		while (state.resources.size > MAX_NATIVE_RESOURCE_MEMORY) state.resources.delete(state.resources.values().next().value);
-		const looping = detectMovementLoop(state.positions);
-		const movementLoop = looping && state.movementLoopActive !== true;
 		const previousPlayer = state.player;
 		state.player = observation.player;
-		// Repeated samples of the same unresolved loop are not new decisions.
-		// Moving out of it rearms attention without an arbitrary cooldown.
-		state.movementLoopActive = looping;
 		this.#nativeWorldSignals.set(record.agentId, state);
 		return {
 			previousPlayer,
 			movementLoop,
 			resourceDiscovery,
 		};
+	}
+
+	#nativeWorldState(record, lifecycleGeneration, connectionEpoch) {
+		const previous = this.#nativeWorldSignals.get(record.agentId);
+		const sameLifecycle = previous?.goalRevision === record.goalRevision
+			&& previous.lifecycleGeneration === lifecycleGeneration
+			&& previous.connectionEpoch === connectionEpoch;
+		return sameLifecycle
+			? previous
+			: { goalRevision: record.goalRevision, lifecycleGeneration, connectionEpoch, positions: [], resources: new Set() };
+	}
+
+	/**
+	 * Full observations now arrive only when a fact changed, so a walk back and forth is also sampled from the position
+	 * every action progress message carries. A loop seen there asks the server for an observation, which merges the
+	 * pending attention, so the model hears of it as fast as when every position change produced an observation.
+	 */
+	#sampleProgressMovement(record, lifecycleGeneration, connectionEpoch, position) {
+		const state = this.#nativeWorldState(record, lifecycleGeneration, connectionEpoch);
+		const movementLoop = sampleMovement(state, nativeBlockPositionKey(position));
+		this.#nativeWorldSignals.set(record.agentId, state);
+		if (!movementLoop) return;
+		this.#rememberPendingAttention(record.agentId, record.goalRevision, { priority: 'urgent', trigger: 'movement_loop' });
+		void Promise.resolve(this.#bridge.send('request_observation', record.agentId, { goalRevision: record.goalRevision })).catch(() => {});
 	}
 
 	#usesNativeTools(record) {
@@ -4990,6 +5003,20 @@ export function classifyObservationTrigger(payload, observation, signals = null)
 	if (signals?.resourceDiscovery === true) return { attention: true, priority: 'ordinary', trigger: 'resource_discovery' };
 	if (!attention) return { attention: false, priority: 'ordinary', trigger: 'observation' };
 	return { attention: true, priority: 'ordinary', trigger: 'attention' };
+}
+
+/** Records a block position (repeats collapse) and reports whether it newly completed a movement loop. */
+function sampleMovement(state, positionKey) {
+	if (positionKey !== null && positionKey !== state.positions.at(-1)) {
+		state.positions.push(positionKey);
+		if (state.positions.length > MAX_NATIVE_MOVEMENT_HISTORY) state.positions.shift();
+	}
+	const looping = detectMovementLoop(state.positions);
+	// Repeated samples of the same unresolved loop are not new decisions.
+	// Moving out of it rearms attention without an arbitrary cooldown.
+	const movementLoop = looping && state.movementLoopActive !== true;
+	state.movementLoopActive = looping;
+	return movementLoop;
 }
 
 /** Detects a repeated two-point walk without flagging ordinary forward travel. */

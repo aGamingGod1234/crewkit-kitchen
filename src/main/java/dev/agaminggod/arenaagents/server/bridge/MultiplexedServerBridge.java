@@ -42,6 +42,7 @@ import dev.agaminggod.arenaagents.server.goal.GoalInventoryCapacity;
 import dev.agaminggod.arenaagents.server.goal.GoalSpecWireCodec;
 import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntime;
 import dev.agaminggod.arenaagents.server.goal.GoalSubmission;
+import dev.agaminggod.arenaagents.server.perception.ObservationBlockTags;
 import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
 import dev.agaminggod.arenaagents.server.perception.AttentionFactDelta;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
@@ -1039,6 +1040,23 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		source.beginAuthentication(clientNonce, serverNonce, response);
 	}
 
+	/** Whether the coordinator's hello announced an optional capability; a coordinator that predates it says nothing. */
+	static boolean announcedCapability(JsonObject hello, String name) {
+		if (!hello.has(name)) return false;
+		JsonElement capability = hello.get(name);
+		if (!capability.isJsonPrimitive() || !capability.getAsJsonPrimitive().isBoolean()) throw new BridgeProtocolException("INVALID_FIELD", name + " must be a boolean");
+		return capability.getAsBoolean();
+	}
+
+	/**
+	 * Observation tags are listed once per block type only for a coordinator that announced {@code blockTags}; an older
+	 * one (the installer can keep a last-known-good coordinator) rejects the dictionary, so its rows keep their tags.
+	 */
+	static JsonObject forSession(JsonObject observation, boolean blockTags) {
+		if (blockTags) ObservationBlockTags.compact(observation);
+		return observation;
+	}
+
 	private void acceptHello(BridgeEnvelope envelope, Session source) {
 		if (!"hello".equals(envelope.type()) || !"server".equals(envelope.agentId())) {
 			throw new BridgeProtocolException("HANDSHAKE_REQUIRED", "hello must be the first coordinator message");
@@ -1060,16 +1078,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (!MessageDigest.isEqual(expectedProof.getBytes(StandardCharsets.UTF_8), suppliedProof.getBytes(StandardCharsets.UTF_8))) {
 			throw new BridgeProtocolException("AUTHENTICATION_FAILED", "Coordinator did not prove possession of the bridge secret");
 		}
-		if (envelope.payload().has("registryFragments")) {
-			JsonElement capability = envelope.payload().get("registryFragments");
-			if (!capability.isJsonPrimitive() || !capability.getAsJsonPrimitive().isBoolean()) throw new BridgeProtocolException("INVALID_FIELD", "registryFragments must be a boolean");
-			source.registryFragments = capability.getAsBoolean();
-		}
-		if (envelope.payload().has("actionTiming")) {
-			JsonElement capability = envelope.payload().get("actionTiming");
-			if (!capability.isJsonPrimitive() || !capability.getAsJsonPrimitive().isBoolean()) throw new BridgeProtocolException("INVALID_FIELD", "actionTiming must be a boolean");
-			source.actionTiming = capability.getAsBoolean();
-		}
+		source.registryFragments = announcedCapability(envelope.payload(), "registryFragments");
+		source.actionTiming = announcedCapability(envelope.payload(), "actionTiming");
+		source.blockTags = announcedCapability(envelope.payload(), "blockTags");
 
 		while (true) {
 			ensureHandshakeTimeRemaining(source);
@@ -1485,7 +1496,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			String section = requiredString(query, "section");
 			if ("observation".equals(section)) {
 				observations.invalidate(id);
-				JsonObject observation = observations.collect(id);
+				JsonObject observation = forSession(observations.collect(id), source.blockTags);
 				ObservationPublication.Result published = publishObservationWithInputGuard(
 						observationPublication, AgentInputRuntime.existingController(manager.server()), id, source, observation,
 						(agent, fresh) -> {
@@ -3022,7 +3033,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		boolean heartbeat = observationPublication.takeHeartbeat(agentId);
 		final JsonObject observation;
 		try {
-			observation = observations.collect(agentId);
+			observation = forSession(observations.collect(agentId), source.blockTags);
 			ObservationPublication.Result result = publishOwnedObservationWithInputGuard(
 					observationPublication,
 					AgentInputRuntime.existingController(manager.server()),
@@ -4122,6 +4133,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		private final long handshakeTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(HANDSHAKE_TIMEOUT_MS);
 		private volatile boolean registryFragments;
 		private volatile boolean actionTiming;
+		private volatile boolean blockTags;
 		private volatile String clientNonce;
 		private volatile String serverNonce;
 		private volatile String authResponseMessageId;

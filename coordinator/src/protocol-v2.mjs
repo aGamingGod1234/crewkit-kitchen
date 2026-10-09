@@ -238,7 +238,7 @@ function normalizeProtocolV2Payload(type, value) {
 				proof: authenticationToken(value.proof, 'proof'),
 			};
 		case 'hello':
-			exactKeys(value, ['replyTo', 'clientNonce', 'serverNonce', 'proof', 'launchId', 'registryFragments', 'actionTiming'], ['replyTo', 'clientNonce', 'serverNonce', 'proof'], type);
+			exactKeys(value, ['replyTo', 'clientNonce', 'serverNonce', 'proof', 'launchId', 'registryFragments', 'actionTiming', 'blockTags'], ['replyTo', 'clientNonce', 'serverNonce', 'proof'], type);
 			return {
 				replyTo: boundedText(value.replyTo, 'replyTo', MAX_COMMAND_ID_LENGTH),
 				clientNonce: authenticationToken(value.clientNonce, 'clientNonce'),
@@ -246,6 +246,7 @@ function normalizeProtocolV2Payload(type, value) {
 				proof: authenticationToken(value.proof, 'proof'),
 				...(value.registryFragments === undefined ? {} : { registryFragments: boolean(value.registryFragments, 'registryFragments') }),
 				...(value.actionTiming === undefined ? {} : { actionTiming: boolean(value.actionTiming, 'actionTiming') }),
+				...(value.blockTags === undefined ? {} : { blockTags: boolean(value.blockTags, 'blockTags') }),
 				...(value.launchId === undefined ? {} : { launchId: launchIdentity(value.launchId) }),
 			};
 		case 'hello_ack':
@@ -849,6 +850,8 @@ export class MultiplexedServerBridge extends EventEmitter {
 				}),
 				registryFragments: true,
 				actionTiming: true,
+				// Tells the server it may list each block type's tags once; a server that predates this ignores the field.
+				blockTags: true,
 				...(this.#launchId === null ? {} : { launchId: this.#launchId }),
 			},
 		});
