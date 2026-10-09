@@ -22,5 +22,6 @@ public final class ArenaAgents implements ModInitializer {
 		ArenaAgentCommands.register();
 		CodexAgentCommands.register();
 		CodexAgentServerRuntime.register();
+		dev.agaminggod.arenaagents.crewkit.cast.CastCommands.register();
 	}
 }

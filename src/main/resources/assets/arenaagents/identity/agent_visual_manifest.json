@@ -1,5 +1,8 @@
 {
   "schemaVersion": 1,
+  "specialSkins": [
+    {"key": "crewkit_chef", "label": "CrewKit chef", "texturePath": "arenaagents:textures/entity/crewkit_chef.png"}
+  ],
   "brandSkins": [
     {
       "key": "openai",

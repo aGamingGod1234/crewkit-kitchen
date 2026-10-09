@@ -80,6 +80,15 @@ public final class AgentVisualIdentity {
 		return variants.get(variant);
 	}
 
+	/** Key of the CrewKit Kitchen chef skin in the manifest's specialSkins list. */
+	public static final String CREWKIT_CHEF_SKIN = "crewkit_chef";
+
+	/** Returns a bundled one-off skin (for example the CrewKit chef) that is assigned outside provider identity. */
+	public static Optional<String> specialTexturePath(String key) {
+		if (key == null || key.isBlank()) return Optional.empty();
+		return Optional.ofNullable(MANIFEST.specialSkinPaths().get(key.trim().toLowerCase(Locale.ROOT)));
+	}
+
 	/** Selects the company-brand texture used by every client-side agent render. */
 	public static String renderTexturePath(Resolved identity) {
 		Objects.requireNonNull(identity, "identity must not be null");
@@ -175,7 +184,10 @@ public final class AgentVisualIdentity {
 	}
 
 	private static Manifest parseManifest(JsonObject root) {
-		requireKeys(root, Set.of("schemaVersion", "brandSkins", "providers"), "manifest");
+		// specialSkins is optional so older manifests stay valid.
+		requireKeys(root, root.has("specialSkins")
+				? Set.of("schemaVersion", "brandSkins", "providers", "specialSkins")
+				: Set.of("schemaVersion", "brandSkins", "providers"), "manifest");
 		if (requiredInt(root, "schemaVersion", "manifest") != 1) {
 			throw invalid("manifest schemaVersion must be 1");
 		}
@@ -198,7 +210,26 @@ public final class AgentVisualIdentity {
 			throw invalid("manifest providers must be exactly " + REQUIRED_PROVIDERS);
 		}
 		Map<String, List<String>> brandSkinPaths = parseBrandSkins(root.getAsJsonArray("brandSkins"));
-		return new Manifest(Map.copyOf(byProvider), Map.copyOf(byTransportCode), brandSkinPaths);
+		Map<String, String> specialSkinPaths = root.has("specialSkins")
+				? parseSpecialSkins(requiredArray(root, "specialSkins", "manifest"))
+				: Map.of();
+		return new Manifest(Map.copyOf(byProvider), Map.copyOf(byTransportCode), brandSkinPaths, specialSkinPaths);
+	}
+
+	private static Map<String, String> parseSpecialSkins(JsonArray skins) {
+		Map<String, String> pathsByKey = new LinkedHashMap<>();
+		for (JsonElement element : skins) {
+			JsonObject skin = requireObject(element, "special skin");
+			requireKeys(skin, Set.of("key", "label", "texturePath"), "special skin");
+			String key = requiredKey(skin, "key", "special skin");
+			requiredString(skin, "label", "special skin " + key);
+			String texturePath = requiredString(skin, "texturePath", "special skin " + key);
+			if (!TEXTURE_PATH.matcher(texturePath).matches()) {
+				throw invalid("special skin texture must be project-owned: " + texturePath);
+			}
+			if (pathsByKey.putIfAbsent(key, texturePath) != null) throw invalid("duplicate special skin: " + key);
+		}
+		return Map.copyOf(pathsByKey);
 	}
 
 	private static Map<String, List<String>> parseBrandSkins(JsonArray brands) {
@@ -403,7 +434,8 @@ public final class AgentVisualIdentity {
 	private record Manifest(
 		Map<String, ProviderIdentity> providers,
 		Map<String, TransportIdentity> transportCodes,
-		Map<String, List<String>> brandSkinPaths
+		Map<String, List<String>> brandSkinPaths,
+		Map<String, String> specialSkinPaths
 	) {
 	}
 

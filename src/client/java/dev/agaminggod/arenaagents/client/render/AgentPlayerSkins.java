@@ -7,6 +7,7 @@ import dev.agaminggod.arenaagents.client.control.AgentClientRoster;
 import dev.agaminggod.arenaagents.client.control.DirectorClientState;
 import dev.agaminggod.arenaagents.control.AgentControlAgent;
 import java.util.Optional;
+import net.minecraft.client.Minecraft;
 import net.minecraft.core.ClientAsset;
 import net.minecraft.resources.Identifier;
 import net.minecraft.world.entity.player.PlayerModelType;
@@ -19,6 +20,8 @@ public final class AgentPlayerSkins {
 
 	public static Optional<PlayerSkin> forProfile(GameProfile profile) {
 		String name = profile.name();
+		Optional<PlayerSkin> chef = crewkitChef(name);
+		if (chef.isPresent()) return chef;
 		AgentControlAgent agent = AgentClientRoster.agentForPlayer(name).orElse(null);
 		AgentVisualIdentity.Resolved identity;
 		if (agent != null) {
@@ -46,5 +49,21 @@ public final class AgentPlayerSkins {
 		Identifier texture = CodexAgentRenderer.textureFor(identity);
 		ClientAsset.Texture body = new ClientAsset.ResourceTexture(texture, texture);
 		return Optional.of(new PlayerSkin(body, null, null, PlayerModelType.WIDE, false));
+	}
+
+	/**
+	 * CrewKit Kitchen: whoever the server puts on the "crewkit_chef" scoreboard team wears the chef skin.
+	 * Team membership is synced to every client, so this works on dedicated and integrated servers alike,
+	 * and it is resolved per call so assigning the chef mid-session re-skins the body at once.
+	 */
+	private static Optional<PlayerSkin> crewkitChef(String name) {
+		var level = Minecraft.getInstance().level;
+		if (level == null || name == null) return Optional.empty();
+		var team = level.getScoreboard().getPlayersTeam(name);
+		if (team == null || !team.getName().equals(AgentVisualIdentity.CREWKIT_CHEF_SKIN)) return Optional.empty();
+		return AgentVisualIdentity.specialTexturePath(AgentVisualIdentity.CREWKIT_CHEF_SKIN).map(path -> {
+			Identifier texture = Identifier.parse(path);
+			return new PlayerSkin(new ClientAsset.ResourceTexture(texture, texture), null, null, PlayerModelType.WIDE, false);
+		});
 	}
 }
