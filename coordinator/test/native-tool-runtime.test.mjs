@@ -961,6 +961,20 @@ test('replacement stays unstarted if the previous action finishes before cancell
 	assert.equal(sent.filter(([type]) => type === 'action_command').length, 1);
 });
 
+test('replaceAction does not start from an old receipt outside a danger-paused fight or flee', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
+	const previous = await runtime.execute(nativeCall({ kind: 'start_action', actionType: 'wait', arguments: { durationMs: 100 } }), record());
+	runtime.onActionResult(record(), { actionId: previous.actionId, state: 'SUCCEEDED', reasonCode: 'ACTION_COMPLETED' });
+	const replacement = await runtime.execute(nativeCall({ kind: 'replace_action', actionId: previous.actionId, goalRevision: 3,
+		actionType: 'flee_from', arguments: { targetId: '00000000-0000-0000-0000-0000000000a1', distance: 12, timeoutMs: 8_000 } }), record());
+	assert.equal(replacement.state, 'REPLACEMENT_NOT_STARTED');
+	assert.equal(replacement.reasonCode, 'ACTION_FINISHED_BEFORE_CANCEL');
+	assert.equal(replacement.previous.actionId, previous.actionId);
+	assert.equal(sent.filter(([type]) => type === 'action_command').length, 1);
+	await runtime.disposeAll();
+});
+
 test('notebook scopes model notes and authoritative receipts to the observed world', async () => {
 	const writes = [];
 	const queries = [];

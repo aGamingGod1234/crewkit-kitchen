@@ -189,6 +189,49 @@ test('an unresolved decision prevents natural exhaustion and remains visible in 
 	assert.equal(result.decision.trigger, 'health_changed');
 });
 
+test('a superseded continue is still rejected after an urgent decision replaces the facts', async () => {
+	const decisions = [];
+	let release;
+	const run = setup({
+		onDecision: status => decisions.push(status.decision),
+		executeAction: () => new Promise(resolve => { release = resolve; }),
+		cancelAction: async () => release({ state: 'CANCELLED', reasonCode: 'INPUT_RELEASED', observation: observation(12), eventSequence: 4 }),
+	});
+	const pending = run.executor.run(record, { programId: 'superseded-continue', source: `${prefix} await player.wait(1000);` }, run.context);
+	run.executor.onObservation(record, { observation: observation(20), eventSequence: 2, attention: true, priority: 'ordinary', trigger: 'resource_discovery' });
+	await turn();
+	const oldDecisionId = decisions[0].decisionId;
+	run.executor.onObservation(record, { observation: observation(12), eventSequence: 3, attention: true, priority: 'urgent', trigger: 'damage' });
+	await turn();
+	assert.notEqual(run.executor.status(record).decision.decisionId, oldDecisionId);
+	assert.throws(() => run.executor.respond(record, { programId: 'superseded-continue', decisionId: oldDecisionId, directive: 'continue' }), { code: 'STALE_PROGRAM_DECISION' });
+	await run.executor.cancel(record.agentId);
+	await pending;
+});
+
+for (const directive of ['pause', 'finish']) {
+	test(`a superseded ${directive} applies to the live decision for the same program`, async () => {
+		const decisions = [];
+		let release;
+		const run = setup({
+			onDecision: status => decisions.push(status.decision),
+			executeAction: () => new Promise(resolve => { release = resolve; }),
+			cancelAction: async () => release({ state: 'CANCELLED', reasonCode: 'INPUT_RELEASED', observation: observation(12), eventSequence: 4 }),
+		});
+		const programId = `superseded-${directive}`;
+		const pending = run.executor.run(record, { programId, source: `${prefix} await player.wait(1000);` }, run.context);
+		run.executor.onObservation(record, { observation: observation(20), eventSequence: 2, attention: true, priority: 'ordinary', trigger: 'resource_discovery' });
+		await turn();
+		const oldDecisionId = decisions[0].decisionId;
+		run.executor.onObservation(record, { observation: observation(12), eventSequence: 3, attention: true, priority: 'urgent', trigger: 'damage' });
+		await turn();
+		assert.notEqual(run.executor.status(record).decision.decisionId, oldDecisionId);
+		const result = await run.executor.respond(record, { programId, decisionId: oldDecisionId, directive });
+		assert.equal(result.reasonCode, directive === 'pause' ? 'MODEL_PAUSED' : 'PROGRAM_FINISH_REQUESTED');
+		await pending;
+	});
+}
+
 test('source replacement keeps the run parameters and reports its final version and complete action totals', async () => {
 	let release;
 	const commands = [];

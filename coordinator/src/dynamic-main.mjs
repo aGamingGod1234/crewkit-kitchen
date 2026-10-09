@@ -5191,9 +5191,9 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 			throw Object.assign(new TypeError(`Native event context leaves no room for unread conversation sequence ${unreadConversation.entries[0].sequence}; messages remain unread. Reduce the event or task context before retrying.`), { code: 'NATIVE_CONVERSATION_BUDGET_EXCEEDED' });
 		}
 	}
-	// A program paused by damage or a threat must not cost a respondProgram/programStatus detour first:
-	// fight_target and flee_from run directly while it is paused (native-tool-runtime keeps its decision).
-	const dangerPaused = !isPlanningDue && status?.engineState === 'SUSPENDED' && DANGER_PAUSE_TRIGGERS.has(status?.decision?.trigger);
+	// Urgent program decisions should surface the direct danger response before a respondProgram detour;
+	// fight_target and flee_from can run while the program pauses or awaits an explicit decision.
+	const dangerDecision = !isPlanningDue && status?.decision?.priority === 'urgent' && DANGER_DECISION_TRIGGERS.has(status.decision.trigger);
 	const instruction = conversationOnly === true && dangerWake === true
 		? NO_TASK_DANGER_INSTRUCTION
 		: conversationOnly === true && selfCareWake === true
@@ -5202,8 +5202,8 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 		? 'Player conversation. You have no active task. If a message asks you to do something, call takeTask (it defaults to the sender\'s words; use resume:true to continue a paused task), then end this turn; your task turn starts at once with every tool. Otherwise reply with say.'
 		: isPlanningDue
 		? 'Live Minecraft event. Program planning is due soon: prepare the next intention while the current authorised routine keeps running. This is advisory and does not require a pending decisionId; use the current programVersion and timing context, and do not blindly renew or cancel the current program.'
-		: dangerPaused
-			? 'Live Minecraft event. Program paused for danger: call fight_target or flee_from now; respond to the program later.'
+		: dangerDecision
+			? dangerDecisionInstruction(status.decision.trigger)
 			: awaitingConfirmation === true
 				? AWAITING_CONFIRMATION_EVENT_INSTRUCTION
 				: effectiveTrigger === 'low_health_food'
@@ -5212,7 +5212,16 @@ export function buildNativeEventInput(record, { event, trigger, programId, statu
 	return `${instruction}\n${json}`;
 }
 
-const DANGER_PAUSE_TRIGGERS = new Set(['damage', 'threat']);
+const DANGER_DECISION_TRIGGERS = new Set(['damage', 'threat', 'lava', 'fire', 'suffocation', 'fall', 'defensive_handler_completed']);
+function dangerDecisionInstruction(trigger) {
+	if (['damage', 'threat', 'lava', 'fire'].includes(trigger)) {
+		return 'Live Minecraft event. Danger needs attention: call fight_target or flee_from now; respond to the program later.';
+	}
+	if (trigger === 'suffocation') return 'Live Minecraft event. Suffocation needs attention: use fresh facts to address it, then respond to the program.';
+	if (trigger === 'fall') return 'Live Minecraft event. Fall danger needs attention: choose a safe response from fresh facts, then respond to the program.';
+	if (trigger === 'defensive_handler_completed') return 'Live Minecraft event. The defensive handler finished; check its result and fresh facts, then respond to the program.';
+	return 'Live Minecraft event. Danger needs attention: choose a safe response from fresh facts, then respond to the program.';
+}
 // Urgent facts that wake an agent with no task: the body is still the model's to defend.
 const NO_TASK_WAKE_TRIGGERS = new Set(['damage', 'threat', 'lava', 'fire', 'suffocation', 'fall', 'low_health']);
 // With no task, a danger-woken turn may defend the body only: these mirror Minecraft's own detached-action allowlist

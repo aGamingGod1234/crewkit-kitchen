@@ -3,11 +3,12 @@ import test from 'node:test';
 import { NativeProgramExecutor } from '../src/native-program-executor.mjs';
 
 const record = { agentId: 'attention-throttle', goalRevision: 1, provider: 'claude', model: 'selected-model', reasoningEffort: 'low', serviceTier: 'priority' };
-const observation = (health = 20) => ({ player: { x: 0, y: 64, z: 0, health }, entities: [], items: [], blocks: [], inventory: { items: [], tagCounts: {} } });
+const observation = (health = 20, { entities = [], player = {}, blocks = [] } = {}) => ({ player: { x: 0, y: 64, z: 0, health, ...player }, entities, items: [], blocks, inventory: { items: [], tagCounts: {} } });
 const turn = () => new Promise(resolve => setImmediate(resolve));
 
 function setup(t, policy = 'continue_and_notify') {
-	let now = 1_000_000;
+	let now = 1_000_000, sequence = 1;
+	let latestObservation = observation();
 	const timers = [], decisions = [], pending = [];
 	const executor = new NativeProgramExecutor({
 		setTimeoutFn: (callback, ms) => { const timer = { callback, ms, cleared: false }; timers.push(timer); return timer; },
@@ -16,15 +17,18 @@ function setup(t, policy = 'continue_and_notify') {
 		ordinaryAttentionIntervalMs: 30_000,
 	});
 	const result = executor.run(record, { source: `program.onUnhandledAttention("${policy}"); await player.wait(1); await player.wait(2);`, programId: 'throttle' }, {
-		observation: observation(), eventSequence: 1,
+		observation: latestObservation, eventSequence: 1,
 		executeAction: () => new Promise((resolve) => { pending.push(resolve); }),
-		cancelAction: async () => { for (const resolve of pending.splice(0)) resolve({ state: 'CANCELLED', reasonCode: 'INPUT_RELEASED' }); return { state: 'CANCELLED' }; },
-		onDecision: (status, { priority }) => decisions.push({ decisionId: status.decision?.decisionId, priority }),
+		cancelAction: async () => { for (const resolve of pending.splice(0)) resolve({ state: 'CANCELLED', reasonCode: 'INPUT_RELEASED', observation: latestObservation, eventSequence: ++sequence }); return { state: 'CANCELLED' }; },
+		onDecision: (status, { priority }) => decisions.push({ decisionId: status.decision?.decisionId, eventSequence: status.decision?.eventSequence, priority }),
 	});
 	t.after(() => executor.cancel(record.agentId));
-	let sequence = 1;
-	const sight = (extra = {}) => executor.onObservation(record, { observation: observation(extra.health), eventSequence: ++sequence, attention: true, priority: 'ordinary', trigger: 'resource_discovery', ...extra });
-	const finishAction = () => { for (const resolve of pending.splice(0)) resolve({ state: 'SUCCEEDED', reasonCode: 'DONE', observation: observation(), eventSequence: ++sequence }); };
+	const sight = (extra = {}) => {
+		const { health, entities, player, blocks, ...attention } = extra;
+		latestObservation = observation(health, { entities, player, blocks });
+		return executor.onObservation(record, { observation: latestObservation, eventSequence: ++sequence, attention: true, priority: 'ordinary', trigger: 'resource_discovery', ...attention });
+	};
+	const finishAction = () => { for (const resolve of pending.splice(0)) resolve({ state: 'SUCCEEDED', reasonCode: 'DONE', observation: latestObservation, eventSequence: ++sequence }); };
 	return { executor, result, timers, decisions, sight, finishAction, advance: (ms) => { now += ms; } };
 }
 
@@ -74,6 +78,319 @@ test('urgent attention always notifies at once', async t => {
 	assert.equal(run.decisions[1].priority, 'urgent');
 });
 
+test('an urgent batch notifies the latest sequence and accepts continue without a status round trip', async t => {
+	const run = setup(t);
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 18 });
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 16 });
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 14 });
+	await turn();
+	assert.equal(run.decisions.length, 1, 'urgent observations in one bridge batch coalesce');
+	const { decisionId, eventSequence } = run.decisions[0];
+	assert.equal(run.executor.status(record).decision.eventSequence, eventSequence, 'the live handle carries the latest observed facts');
+	assert.equal(run.executor.status(record).decision.trigger, 'damage');
+	assert.equal(eventSequence, 5, 'notification records the facts the model actually received');
+	assert.equal(run.executor.respond(record, { programId: 'throttle', decisionId, directive: 'continue' }).engineState, 'ACTIVE');
+});
+
+test('continue accepts more damage from the same attacker within the ongoing-danger threshold', async t => {
+	const run = setup(t);
+	const zombie = { stableId: 'zombie-a', type: 'minecraft:zombie', hostile: true, x: 1, y: 64, z: 0 };
+	run.sight();
+	await turn();
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 18, entities: [zombie], player: { lastAttacker: { uuid: 'zombie-a' } } });
+	await turn();
+	assert.equal(run.decisions.length, 2, 'the urgent facts are notified after the ordinary attention');
+	const notified = run.decisions.at(-1);
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 16, entities: [zombie], player: { lastAttacker: { uuid: 'zombie-a' } } });
+	assert.equal(run.executor.respond(record, { programId: 'throttle', decisionId: notified.decisionId,
+		eventSequence: notified.eventSequence, directive: 'continue' }).engineState, 'ACTIVE');
+});
+
+test('continue rejects a health loss greater than two hearts even from the same attacker', async t => {
+	const run = setup(t);
+	const zombie = { stableId: 'zombie-a', type: 'minecraft:zombie', hostile: true, x: 1, y: 64, z: 0 };
+	run.sight();
+	await turn();
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 18, entities: [zombie], player: { lastAttacker: { uuid: 'zombie-a' } } });
+	await turn();
+	const notified = run.decisions.at(-1);
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 12, entities: [zombie], player: { lastAttacker: { uuid: 'zombie-a' } } });
+	assert.throws(() => run.executor.respond(record, { programId: 'throttle', decisionId: notified.decisionId,
+		eventSequence: notified.eventSequence, directive: 'continue' }), (error) => {
+		assert.equal(error.code, 'STALE_PROGRAM_DECISION');
+		assert.equal(error.freshDecision.facts.health.droppedBy, 6);
+		return true;
+	});
+});
+
+test('continue rejects a critical health floor even when the loss is within the bounded delta', async t => {
+	const run = setup(t);
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 5 });
+	await turn();
+	const notified = run.decisions.at(-1);
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 1 });
+	assert.throws(() => run.executor.respond(record, { programId: 'throttle', decisionId: notified.decisionId,
+		eventSequence: notified.eventSequence, directive: 'continue' }), (error) => {
+		assert.equal(error.code, 'STALE_PROGRAM_DECISION');
+		assert.equal(error.freshDecision.facts.health.lowRemainingHealth, true);
+		assert.equal(error.freshDecision.facts.health.current, 1);
+		return true;
+	});
+});
+
+test('continue rejects health loss greater than half of the remaining health', async t => {
+	const run = setup(t);
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 11 });
+	await turn();
+	const notified = run.decisions.at(-1);
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 7 });
+	assert.throws(() => run.executor.respond(record, { programId: 'throttle', decisionId: notified.decisionId,
+		eventSequence: notified.eventSequence, directive: 'continue' }), (error) => {
+		assert.equal(error.code, 'STALE_PROGRAM_DECISION');
+		assert.equal(error.freshDecision.facts.health.droppedBy, 4);
+		assert.equal(error.freshDecision.facts.health.largeRelativeDrop, true);
+		return true;
+	});
+});
+
+test('continue rejects zero air even when the air loss equals the bounded delta', async t => {
+	const run = setup(t);
+	run.sight({ priority: 'urgent', trigger: 'suffocation', player: { air: 20 } });
+	await turn();
+	const notified = run.decisions.at(-1);
+	run.sight({ priority: 'urgent', trigger: 'suffocation', player: { air: 0 } });
+	assert.throws(() => run.executor.respond(record, { programId: 'throttle', decisionId: notified.decisionId,
+		eventSequence: notified.eventSequence, directive: 'continue' }), (error) => {
+		assert.equal(error.code, 'STALE_PROGRAM_DECISION');
+		assert.equal(error.freshDecision.facts.air.critical, true);
+		assert.equal(error.freshDecision.facts.air.current, 0);
+		return true;
+	});
+});
+
+test('continue rejects negative air even when the air loss equals the bounded delta', async t => {
+	const run = setup(t);
+	run.sight({ priority: 'urgent', trigger: 'suffocation', player: { air: 0 } });
+	await turn();
+	const notified = run.decisions.at(-1);
+	run.sight({ priority: 'urgent', trigger: 'suffocation', player: { air: -20 } });
+	assert.throws(() => run.executor.respond(record, { programId: 'throttle', decisionId: notified.decisionId,
+		eventSequence: notified.eventSequence, directive: 'continue' }), (error) => {
+		assert.equal(error.code, 'STALE_PROGRAM_DECISION');
+		assert.equal(error.freshDecision.facts.air.critical, true);
+		assert.equal(error.freshDecision.facts.air.current, -20);
+		return true;
+	});
+});
+
+test('continue rejects a creeper approaching inside three blocks without swelling', async t => {
+	const run = setup(t);
+	run.sight();
+	await turn();
+	const creeper = { stableId: 'creeper-close', type: 'minecraft:creeper', hostile: true, swelling: false, x: 3, y: 64, z: 0 };
+	run.sight({ priority: 'urgent', trigger: 'threat', entities: [creeper] });
+	await turn();
+	const notified = run.decisions.at(-1);
+	run.sight({ priority: 'urgent', trigger: 'threat', entities: [{ ...creeper, x: 1 }] });
+	assert.throws(() => run.executor.respond(record, { programId: 'throttle', decisionId: notified.decisionId,
+		eventSequence: notified.eventSequence, directive: 'continue' }), (error) => {
+		assert.equal(error.code, 'STALE_PROGRAM_DECISION');
+		assert.equal(error.freshDecision.facts.changedThreats[0].changes.closeApproach, true);
+		return true;
+	});
+});
+
+test('continue rejects when the player catches fire', async t => {
+	const run = setup(t);
+	run.sight({ priority: 'urgent', trigger: 'damage', player: { onFire: false } });
+	await turn();
+	const notified = run.decisions.at(-1);
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 18, player: { onFire: true } });
+	assert.throws(() => run.executor.respond(record, { programId: 'throttle', decisionId: notified.decisionId,
+		eventSequence: notified.eventSequence, directive: 'continue' }), (error) => {
+		assert.equal(error.code, 'STALE_PROGRAM_DECISION');
+		assert.deepEqual(error.freshDecision.facts.onFire, { notified: false, current: true });
+		return true;
+	});
+});
+
+test('continue rejects projectiles, TNT, and known hostile types without a hostile flag', async t => {
+	const run = setup(t);
+	run.sight({ priority: 'urgent', trigger: 'threat' });
+	await turn();
+	const notified = run.decisions.at(-1);
+	const entities = [
+		{ stableId: 'arrow-1', type: 'minecraft:arrow', hostile: false, x: 4, y: 64, z: 0 },
+		{ stableId: 'tnt-1', type: 'minecraft:tnt', hostile: false, fuse: 40, x: 5, y: 64, z: 0 },
+		{ stableId: 'dragon-1', type: 'minecraft:ender_dragon', hostile: false, x: 8, y: 64, z: 0 },
+	];
+	run.sight({ priority: 'urgent', trigger: 'threat', entities });
+	assert.throws(() => run.executor.respond(record, { programId: 'throttle', decisionId: notified.decisionId,
+		eventSequence: notified.eventSequence, directive: 'continue' }), (error) => {
+		assert.equal(error.code, 'STALE_PROGRAM_DECISION');
+		assert.deepEqual(error.freshDecision.facts.newThreats.map(({ uuid, type }) => [uuid, type]), [
+			['arrow-1', 'minecraft:arrow'], ['tnt-1', 'minecraft:tnt'], ['dragon-1', 'minecraft:ender_dragon'],
+		]);
+		return true;
+	});
+});
+
+test('continue without eventSequence uses the oldest facts shown for the urgent handle', async t => {
+	const run = setup(t);
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 20 });
+	await turn();
+	const firstNotification = run.decisions.at(-1);
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 16 });
+	await turn();
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 12 });
+	await turn();
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 10 });
+	assert.throws(() => run.executor.respond(record, { programId: 'throttle', decisionId: firstNotification.decisionId,
+		directive: 'continue' }), (error) => {
+		assert.equal(error.code, 'STALE_PROGRAM_DECISION');
+		assert.equal(error.freshDecision.facts.health.notified, 20);
+		assert.equal(error.freshDecision.facts.health.current, 10);
+		assert.equal(error.freshDecision.facts.health.droppedBy, 10);
+		return true;
+	});
+	assert.throws(() => run.executor.respond(record, { programId: 'throttle', decisionId: firstNotification.decisionId,
+		eventSequence: firstNotification.eventSequence, directive: 'continue' }), (error) => {
+		assert.equal(error.code, 'STALE_PROGRAM_DECISION');
+		assert.equal(error.freshDecision.facts.health.droppedBy, 10);
+		return true;
+	});
+});
+
+test('ordinary facts folded into an urgent handle do not cause a spurious stale response', async t => {
+	const run = setup(t);
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 18 });
+	await turn();
+	const notified = run.decisions.at(-1);
+	run.sight({ health: 18 });
+	const folded = run.executor.status(record).decision;
+	assert.ok(folded.eventSequence > notified.eventSequence);
+	assert.equal(run.executor.respond(record, { programId: 'throttle', decisionId: notified.decisionId,
+		eventSequence: folded.eventSequence, directive: 'continue' }).engineState, 'ACTIVE');
+});
+
+test('ordinary-to-urgent escalation returns the fresh decision inline for the old handle', async t => {
+	const run = setup(t);
+	run.sight({ health: 20 });
+	await turn();
+	const oldHandle = run.decisions.at(-1);
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 18 });
+	await turn();
+	const current = run.executor.status(record).decision;
+	assert.notEqual(current.decisionId, oldHandle.decisionId);
+	assert.throws(() => run.executor.respond(record, { programId: 'throttle', decisionId: oldHandle.decisionId,
+		eventSequence: oldHandle.eventSequence, directive: 'continue' }), (error) => {
+		assert.equal(error.code, 'STALE_PROGRAM_DECISION');
+		assert.equal(error.freshDecision.decisionId, current.decisionId);
+		assert.equal(error.freshDecision.trigger, 'damage');
+		assert.match(error.message, /Fresh decision:/);
+		return true;
+	});
+});
+
+test('inline fresh decisions cap threat rows and report omitted threats', async t => {
+	const run = setup(t);
+	run.sight({ priority: 'urgent', trigger: 'threat' });
+	await turn();
+	const notified = run.decisions.at(-1);
+	const entities = Array.from({ length: 60 }, (_, index) => ({ stableId: `zombie-${index}`,
+		type: 'minecraft:zombie', hostile: true, x: index, y: 64, z: 3 }));
+	run.sight({ priority: 'urgent', trigger: 'threat', entities });
+	let firstFresh;
+	assert.throws(() => run.executor.respond(record, { programId: 'throttle', decisionId: notified.decisionId,
+		eventSequence: notified.eventSequence, directive: 'continue' }), (error) => {
+		assert.equal(error.code, 'STALE_PROGRAM_DECISION');
+		firstFresh = error.freshDecision;
+		assert.equal(error.freshDecision.facts.newThreats.length, 8);
+		assert.equal(error.freshDecision.facts.omittedThreats, 52);
+		assert.ok(Buffer.byteLength(error.message) < 3_500);
+		return true;
+	});
+	assert.throws(() => run.executor.respond(record, { programId: 'throttle', decisionId: firstFresh.decisionId,
+		eventSequence: firstFresh.eventSequence, directive: 'continue' }), (error) => {
+		assert.equal(error.code, 'STALE_PROGRAM_DECISION');
+		assert.equal(error.freshDecision.facts.newThreats.length, 8);
+		assert.equal(error.freshDecision.facts.omittedThreats, 44);
+		return true;
+	});
+});
+
+test('materially new danger rejects continue with fresh decision facts for an immediate retry', async t => {
+	const run = setup(t);
+	const zombie = { stableId: 'zombie-a', type: 'minecraft:zombie', hostile: true, x: 1, y: 64, z: 0 };
+	const creeper = { stableId: 'creeper-b', type: 'minecraft:creeper', hostile: true, swelling: false, x: 4, y: 64, z: 0 };
+	run.sight();
+	await turn();
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 18, entities: [zombie], player: { lastAttacker: { uuid: 'zombie-a' } } });
+	await turn();
+	assert.equal(run.decisions.length, 2, 'the urgent facts are notified after the ordinary attention');
+	const notified = run.decisions.at(-1);
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 18, entities: [zombie, creeper], player: { lastAttacker: { uuid: 'zombie-a' } } });
+	let rejection;
+	try {
+		run.executor.respond(record, { programId: 'throttle', decisionId: notified.decisionId,
+			eventSequence: notified.eventSequence, directive: 'continue' });
+	} catch (error) { rejection = error; }
+	assert.equal(rejection?.code, 'STALE_PROGRAM_DECISION');
+	assert.equal(rejection?.freshDecision?.eventSequence, run.executor.status(record).decision.eventSequence);
+	assert.equal(rejection?.freshDecision?.trigger, 'damage');
+	assert.deepEqual(rejection?.freshDecision?.facts?.newThreats?.map(({ uuid, type }) => ({ uuid, type })),
+		[{ uuid: 'creeper-b', type: 'minecraft:creeper' }]);
+	assert.match(rejection?.message ?? '', /Fresh decision:/, 'the fresh handle and facts are inline in the tool rejection');
+	assert.equal(run.executor.respond(record, { programId: 'throttle', decisionId: rejection.freshDecision.decisionId,
+		eventSequence: rejection.freshDecision.eventSequence, directive: 'continue' }).engineState, 'ACTIVE',
+		'the tool rejection itself supplies the retry facts without programStatus');
+});
+
+test('continue rejects a newly attacking entity and a creeper that starts swelling', async t => {
+	await t.test('new attacker', async subtest => {
+		const run = setup(subtest);
+		const zombieA = { stableId: 'zombie-a', type: 'minecraft:zombie', hostile: true, x: 1, y: 64, z: 0 };
+		const zombieB = { stableId: 'zombie-b', type: 'minecraft:zombie', hostile: true, x: 2, y: 64, z: 0 };
+		run.sight();
+		await turn();
+		run.sight({ priority: 'urgent', trigger: 'damage', health: 18, entities: [zombieA], player: { lastAttacker: { uuid: 'zombie-a' } } });
+		await turn();
+		const notified = run.decisions.at(-1);
+		run.sight({ priority: 'urgent', trigger: 'damage', health: 18, entities: [zombieA, zombieB], player: { lastAttacker: { uuid: 'zombie-b' } } });
+		assert.throws(() => run.executor.respond(record, { programId: 'throttle', decisionId: notified.decisionId,
+			eventSequence: notified.eventSequence, directive: 'continue' }), { code: 'STALE_PROGRAM_DECISION' });
+	});
+	await t.test('creeper starts swelling', async subtest => {
+		const run = setup(subtest);
+		const creeper = { stableId: 'creeper-a', type: 'minecraft:creeper', hostile: true, swelling: false, x: 4, y: 64, z: 0 };
+		run.sight();
+		await turn();
+		run.sight({ priority: 'urgent', trigger: 'threat', entities: [creeper] });
+		await turn();
+		const notified = run.decisions.at(-1);
+		run.sight({ priority: 'urgent', trigger: 'threat', entities: [{ ...creeper, swelling: true }] });
+		assert.throws(() => run.executor.respond(record, { programId: 'throttle', decisionId: notified.decisionId,
+			eventSequence: notified.eventSequence, directive: 'continue' }), (error) => {
+			assert.equal(error.code, 'STALE_PROGRAM_DECISION');
+			assert.equal(error.freshDecision.facts.changedThreats[0].changes.swelling, true);
+			return true;
+		});
+	});
+});
+
+test('urgent-to-urgent trigger escalation keeps the same decision handle and refreshes the trigger', async t => {
+	const run = setup(t);
+	run.sight({ priority: 'urgent', trigger: 'damage', health: 18 });
+	await turn();
+	const decisionId = run.decisions[0].decisionId;
+	run.sight({ priority: 'urgent', trigger: 'suffocation', health: 18 });
+	await turn();
+	assert.equal(run.decisions.length, 2, 'a materially different urgent trigger still notifies');
+	assert.equal(run.decisions[1].decisionId, decisionId, 'urgent escalation does not invalidate the handle already shown');
+	assert.equal(run.executor.status(record).decision.trigger, 'suffocation');
+	assert.equal(run.executor.status(record).decision.eventSequence, 4);
+});
+
 test('ordinary attention folded after the last notification is not lost when the model answers continue', async t => {
 	const run = setup(t);
 	run.sight();
@@ -96,6 +413,19 @@ test('ordinary attention folded after the last notification is not lost when the
 	deferred.callback();
 	assert.equal(run.decisions.length, 2);
 	assert.equal(run.decisions[1].decisionId, reopened.decisionId);
+});
+
+test('a folded ordinary decision is not rejected for an older eventSequence', async t => {
+	const run = setup(t);
+	run.sight();
+	await turn();
+	const notified = run.decisions[0];
+	run.advance(3_000);
+	run.sight();
+	await turn();
+	assert.equal(run.executor.status(record).decision.eventSequence, notified.eventSequence + 1);
+	assert.equal(run.executor.respond(record, { programId: 'throttle', decisionId: notified.decisionId,
+		eventSequence: notified.eventSequence, directive: 'continue' }).engineState, 'ACTIVE');
 });
 
 test('a continue with nothing unseen does not reopen a decision', async t => {
@@ -130,6 +460,7 @@ test('hazard edges compare against the previous facts only', async () => {
 	assert.equal(hazardEdge(lava, lava), false, 'lava already in view is not a new edge');
 	assert.equal(hazardEdge({ blocks: [], player: { health: 20 } }, lava), true);
 	assert.equal(hazardEdge({ player: { health: 20, air: 300 } }, { player: { health: 20, air: 280 } }), true);
+	assert.equal(hazardEdge({ player: { onFire: false } }, { player: { onFire: true } }), true);
 	assert.equal(hazardEdge({ player: { health: 18 } }, { player: { health: 20 } }), false, 'healing is not a hazard');
 	assert.equal(hazardEdge(null, lava), false);
 });

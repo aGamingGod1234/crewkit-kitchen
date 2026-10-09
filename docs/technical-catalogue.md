@@ -403,3 +403,11 @@ Notes: before numbers come from the recorded GPT-6.1 Sol "beat the game" session
 - **Solution:** Ordinary wakes are now held while the model's own action runs. Dangers, chat and other urgent events still go through at once. The first held wake starts a 15 s timer, so a one-time sighting is released with the freshest facts even if nothing else arrives, and cancelling or replacing the action releases or drops what was held. The completion wake adopts the named reason of the wake it replaced. An earlier idea that also told the model early about remaining work was removed because replaying recorded traces showed it could add calls.
 - **Result:** (replay of recorded play traces, implementer's figure, not re-measured at integration) 9 of 98 turns were held-back wakes, about 5.9% of model cost. Which wakes were held is traced as `native_wake_deferred_for_action` and `native_wake_resumed_after_action`.
 - **Sources:** this branch, `dynamic-main.mjs` wake hold, `native-tool-runtime.mjs`, `test/wake-while-action-runs.test.mjs`
+
+## Speed run: stable decision handles (Oct 9, 2026)
+
+### Answering a danger wake with a handle that had already gone stale
+- **Problem:** When danger interrupted an agent, the model's answer often named the program or action handle it had been shown, but by the time the answer arrived the handle had changed. The server refused it, the model had to be asked again, and each refusal cost a full model round during a fight.
+- **Solution:** Urgent decisions are now checked against what changed since the model last saw the state, not against an exact handle. A reply that is still safe (at most 4 HP lost, at most 20 air lost, a threat no more than 2 blocks closer, no new attacker, with absolute floors for health, air, close threats, burning, projectiles and TNT) is accepted, otherwise the model is told at once and gets a fresh decision inline, capped at 8 changed rows. The mod never picks the action for the model.
+- **Result:** (simulation of recorded danger wakes, implementer's figure) 13 rejections costing 51.5 s fell to 0. A reviewer replayed 4 cases and 3 were accepted as intended, and the last round added the absolute floors. Not yet checked live on a full match.
+- **Sources:** this branch, `native-program-executor.mjs`, `native-tool-runtime.mjs`, `test/program-attention-throttle.test.mjs`

@@ -161,8 +161,8 @@ test('pause-and-notify retains the continuation until the model explicitly resum
 	assert.equal(run.commands().length, 1, 'fresh facts must not resume a suspended body');
 	const fresh = await run.call('programStatus');
 	assert.equal(fresh.decision.eventSequence, 20);
-	await assert.rejects(run.call('respondProgram', { programId: handle.programId, goalRevision: 1, decisionId: status.decision.decisionId, directive: 'continue' }), { code: 'STALE_PROGRAM_DECISION' });
-	await run.call('respondProgram', { programId: handle.programId, goalRevision: 1, decisionId: fresh.decision.decisionId, directive: 'continue' });
+	assert.equal(fresh.decision.decisionId, status.decision.decisionId, 'urgent notifications refresh facts without invalidating the stable handle');
+	await run.call('respondProgram', { programId: handle.programId, goalRevision: 1, decisionId: fresh.decision.decisionId, eventSequence: fresh.decision.eventSequence, directive: 'continue' });
 	await tick();
 	assert.equal(run.commands()[1].payload.arguments.durationMs, 7);
 	run.finish(run.commands()[1]);
@@ -177,12 +177,15 @@ test('a newer attention invalidates the decision and replacement waits for input
 	await tick();
 	run.observe(10, 10);
 	const old = (await run.call('programStatus')).decision;
-	run.observe(9, 11);
-	await assert.rejects(run.call('respondProgram', { programId: handle.programId, goalRevision: 1, decisionId: old.decisionId, directive: 'continue' }), { code: 'STALE_PROGRAM_DECISION' });
+	run.observe(4, 11);
+	await assert.rejects(run.call('respondProgram', { programId: handle.programId, goalRevision: 1,
+		decisionId: old.decisionId, eventSequence: old.eventSequence, directive: 'continue' }), error =>
+		error.code === 'STALE_PROGRAM_DECISION' && error.freshDecision.eventSequence === 11 && error.message.includes('Fresh decision:'),
+	'materially changed health returns fresh facts inline');
 	const status = await run.call('programStatus');
 	await assert.rejects(run.call('respondProgram', { programId: handle.programId, goalRevision: 1, decisionId: status.decision.decisionId, directive: 'replace', source: 'broken (' }));
 	assert.equal(run.sent.filter(entry => entry.type === 'action_cancel').length, 0, 'invalid replacement cannot disrupt current work');
-	await run.call('respondProgram', { programId: handle.programId, goalRevision: 1, decisionId: status.decision.decisionId, directive: 'replace', source: `${prefix} await player.wait(8);` });
+	await run.call('respondProgram', { programId: handle.programId, goalRevision: 1, decisionId: status.decision.decisionId, eventSequence: status.decision.eventSequence, directive: 'replace', source: `${prefix} await player.wait(8);` });
 	assert.equal(run.commands().length, 1);
 	run.finish(run.commands()[0], 'CANCELLED');
 	await tick();
@@ -209,9 +212,10 @@ test('a repeated deterministic failure replaces an older pending decision and re
 	assert.equal(current.decision.trigger, 'action_failure');
 	assert.equal(current.decision.actionFailure.reasonCode, 'TIMED_OUT');
 	assert.equal(events.at(-1).status.decision.decisionId, current.decision.decisionId);
-	await assert.rejects(run.call('respondProgram', { programId: handle.programId, goalRevision: 1, decisionId: old.decisionId, directive: 'continue' }), { code: 'STALE_PROGRAM_DECISION' });
-	await assert.rejects(run.call('respondProgram', { programId: handle.programId, goalRevision: 1, decisionId: current.decision.decisionId, directive: 'continue' }), { code: 'PROGRAM_REPLACEMENT_REQUIRED' });
-	await run.call('respondProgram', { programId: handle.programId, goalRevision: 1, decisionId: current.decision.decisionId, directive: 'replace', source: `${prefix} await player.wait(3);` });
+	assert.equal(current.decision.decisionId, old.decisionId, 'urgent trigger refresh keeps one stable decision handle');
+	await assert.rejects(run.call('respondProgram', { programId: handle.programId, goalRevision: 1, decisionId: old.decisionId, directive: 'continue' }), { code: 'PROGRAM_REPLACEMENT_REQUIRED' });
+	await assert.rejects(run.call('respondProgram', { programId: handle.programId, goalRevision: 1, decisionId: current.decision.decisionId, eventSequence: current.decision.eventSequence, directive: 'continue' }), { code: 'PROGRAM_REPLACEMENT_REQUIRED' });
+	await run.call('respondProgram', { programId: handle.programId, goalRevision: 1, decisionId: current.decision.decisionId, eventSequence: current.decision.eventSequence, directive: 'replace', source: `${prefix} await player.wait(3);` });
 	assert.equal(run.commands()[2].payload.arguments.durationMs, 3);
 });
 
