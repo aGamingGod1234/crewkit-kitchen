@@ -4,46 +4,59 @@ Track: **Most Worthwhile Problem**. Length: 3:00 exactly, pre-recorded, 1080p60.
 
 **The user:** a student-club workshop organiser who has to turn an attendee list into a complete supply order inside a small approved budget, and then show the club treasurer where every dollar went. Lead with that problem. Minecraft is the shared visual interface everyone can read at a glance, not the point of the project.
 
-**Rule for every number on screen:** it comes from the live Reap sandbox run (or its recorded tape). Fill the `[ ]` placeholders from the take you keep. Never type an amount into a caption that differs from the board.
+**The footage is a replay.** We record the default replay of the real sandbox run (no new live take). Caption the whole demo: `Replayed from the recorded real sandbox run`.
+
+**The run the film shows (every number on screen comes from it):**
+
+- Brief: 6 guests, budget S$105. Each guest gets a badge, a notebook and a pen. Each pair shares a USB-C cable. Extras: sticky notes and markers.
+- First quote S$196.85, OVER by S$91.85, checkout blocked by the server gate.
+- Rework: sold-out swaps, notebooks 3+3, cables 1+1+1, optional sticky notes dropped.
+- Ticker: S$196.85 -> S$137.25 -> S$131.65 -> S$102.75.
+- A human approved with a passkey on Reap's hosted page (sandbox).
+- Reap reported COMPLETED, order `ord_01M4G0J3JSEP31G7NASSA0K649`. Charged S$102.75, variance S$0.00, 154 Reap calls.
+
+Never type an amount into a caption that differs from the board.
 
 ## Shot sources
 
 | Code | Source | How it is captured |
 |---|---|---|
-| **IG** | In-game kitchen | OBS game capture. Camera marks from `/ckcam` (in brackets, e.g. `[wide]`). |
-| **PH** | Phone screen | Phone's own screen recorder during the live take: Reap's hosted approval page. |
-| **CODE** | Code, terminal or README | OBS window capture of VS Code / terminal, or a still screenshot. |
-| **TALK** | Organiser to camera | Phone or laptop webcam, landscape, quiet room. |
+| **IG** | In-game kitchen | OBS game capture of the replay. Camera marks from `/ckcam`. |
+| **CODE** | Code, terminal or README | OBS window capture of VS Code / terminal, or a still screenshot. `.env` never on screen. |
+| **TALK** | Organiser to camera, or Chef by voice | Phone or laptop webcam, or the 15 s voice conversation clip captured in game. |
+| **PH** | Real approval footage | Only if real footage of the passkey approval exists. Otherwise no phone shot. |
 
 ## Standing labels (burn in during editing)
 
-- Top-left, whole film after 0:20: `LIVE · Reap Agentic API sandbox · SGD · no real money moves`
-- Any shortened wait (polling, delivery, plating): `Wait shortened ·  real time [mm:ss]`
-- Delivery scene: `Order placed · delivery visualized`
-- Approval scene: see the disclosure rows at 1:45 and 2:40.
+- Top-left, whole film: `Replayed from the recorded real sandbox run`
+- Any shortened wait: `Wait shortened · real time ~4:30` (use the real figure for each cut)
+- Delivery scene: `COMPLETED · Order placed · delivery visualized`
 - No onchain, crypto or "agent pays" claims anywhere. The human approves; Reap places the order.
 
 ## Beat by beat
 
-| Time | Shot | Picture | Voiceover | On-screen caption |
-|---|---|---|---|---|
-| 0:00–0:20 | **TALK** (placeholder), then IG `[wide]` under the last line | Organiser (club member) on camera, 10–15 s, their real story. Fade to the empty kitchen wide. | Organiser, own words. Prompt to give them: "Tell us about the last time you bought supplies for a club workshop. What went wrong with the budget or the receipts?" If no recording, use the fallback VO: "Last term I ran a workshop for forty people. I bought supplies the night before, went over budget, and spent a week matching receipts for the treasurer." | `[Name], [club], workshop organiser` |
-| 0:20–0:40 | IG `[wide]` → `[gate]` (ticket on the rail) | Order ticket slides onto the rail. Guests walk in and sit by name. Timer starts. | "So we gave the job to an agent. The brief is what an organiser actually has: twelve attendees, what each one must get, what may be swapped, and a budget that includes shipping. In CrewKit, the agent is a chef and the brief is an order ticket." | `Brief: 12 attendees · per person: [badge, notebook, pen, drink] · per pair: [cable] · room: [speaker] · substitutions allowed: [shared-per-pair] · budget S$[budget] incl. shipping` |
-| 0:40–1:10 | IG `[line]` ↔ `[budget]`, one manual `[line]` close for the hover label. **CODE** insert 4 s at ~0:58. | Chef walks the line; items stack on its head; Reap-calls counter ticks; budget board rolls down. Crosshair on one item: real name, price, merchant. Insert: terminal NDJSON `item_added` lines with the same name and price. | "Every search is a real call to Reap's Agentic API. Each item is a real listing at its real price, and the chef allocates it: one notebook per person, one cable per pair. That's [real product name] at S$[price] from [merchant]. The quantities follow the attendee list, not a guess." | `[Product name] · S$[price] · [merchant] · qty [n]` then `Reap calls: [n]` |
-| 1:10–1:45 | IG `[budget]` → `[gate]` → `[line]` → `[gate]`. **CODE** insert 5 s at ~1:25 (the gate check in `coordinator/src/crewkit/gate.mjs`). | Quote lands with shipping. Counter rolls red; ticket turns red; CREWKIT GATE bars drop. Chef swaps per-person cables for one per pair; extras tumble off. Bars lift. | "Reap returns a quote with shipping: S$[quote 1], S$[over] over budget. Checkout is blocked, and the block is our server code, not the model's judgement. The agent substitutes the way the brief allows, shared cables per pair, and every attendee still gets every required item." | `Quote incl. shipping S$[quote 1] · OVER by S$[over] · CHECKOUT BLOCKED (server rule)` then `Substitution: cable per person → per pair · all requirements met` |
-| 1:45–2:15 | IG `[gate]` → `[qr]`, then **PH** picture-in-picture (right 40% of frame) | Revised quote passes; ticket green. QR appears on the pass. Phone scans it; Reap's hosted approval page shows the same total; tap approve. Hourglass. | "The revised quote, S$[quote 2], passes both checks: under budget and every requirement covered. Now a human has to say yes. The QR opens Reap's own hosted approval page, showing the same S$[quote 2]. The agent never sees the card." | `Revised quote S$[quote 2] · within budget ✓ · requirements ✓` and on the phone: `Reap hosted approval (sandbox) · same amount as quote` |
-| 2:15–2:40 | IG `[door]` → `[plating]` → `[bill]`. **CODE** insert 4 s at ~2:35 (the CSV in `crewkit-records/`). | Poll returns COMPLETED. Bundle lands at the door, chef unpacks, plates per guest by name. Bill board stamps the row. | "When Reap's poll returns COMPLETED, meaning the merchant order is placed, the bag arrives and each attendee's plate is served by name. The bill board is the receipt for the treasurer: budget, approved quote, final amount, variance and order reference, also saved as a CSV." | Door: `Order placed · delivery visualized`. Board: `Budget S$[b] · Quote S$[q] · Charged S$[f] · Variance S$[v] · Order [ref]` |
-| 2:40–3:00 | IG `[wide]`, slow; end card | Whole kitchen, guests served. End card: name, repo link, team. | "An organiser writes a brief and approves one payment. The agent does the rest, can't overspend, and leaves a receipt anyone can read by looking at the room. Agent Arena is existing work; today we built the Reap purchasing, the gate, the record and the kitchen. That's CrewKit Kitchen." | `Sandbox run: Reap Agentic API, SGD, no real money moved.` · `Approval: real Reap hosted page on the phone (sandbox)` · `Agent Arena (Minecraft agents) = prior work · Built today: Reap purchasing, budget gate, record, kitchen` · `[repo URL] · [team names]` |
+| Time | Picture, action and captions | Voiceover |
+|---|---|---|
+| 0:00–0:12 | Organiser clip, or fallback VO over a wide empty kitchen. | Organiser in their own words. Fallback: "Last term I ran a workshop for forty people. I bought supplies the night before, went over budget, and spent a week matching receipts for the treasurer." |
+| 0:12–0:28 | Organiser talks to Chef by voice (or `/msg`). Ticket slides on, 6 guests sit. Chef: "Order in! Six guests, a hundred and five dollar budget." | "So we gave the job to an agent. The organiser tells Chef the brief: six guests, a hundred and five dollar budget. Each guest needs a badge, a notebook and a pen. Each pair shares a USB-C cable. Sticky notes and markers are extras." |
+| 0:28–0:50 | Line shot: candidate fan, items onto Chef's head, crosshair hover on one real item. 3 s NDJSON insert. Chef sold-out line. | "Every search is a real call to Reap's Agentic API. The items on Chef's head are real listings at real prices. Some are sold out in the sandbox, and Chef says so." |
+| 0:50–1:10 | Budget to gate: S$196.85 lands, ticket red, bars drop. 4 s `gate.mjs` insert. Caption: `OVER by S$91.85 · CHECKOUT BLOCKED (server rule)` | "Reap returns a quote with shipping: one hundred ninety-six dollars eighty-five. That is ninety-one eighty-five over budget. Checkout is blocked, and the block is our server code, not the model's judgement." |
+| 1:10–1:30 | Speed-ramped rework. Caption: `Wait shortened · real time ~4:30` plus the ticker S$196.85 -> 137.25 -> 131.65 -> 102.75. | "Chef reworks the cart. Sold-out items are swapped, notebooks split three and three, cables one, one and one. The quote falls to one thirty-seven, one thirty-one, then one hundred two seventy-five. Only the optional sticky notes are dropped." |
+| 1:30–1:52 | Gate lifts, ticket green, QR + hourglass. Approval caption: `Recorded from the real run: human passkey approval on Reap's hosted page (sandbox)`. Picture-in-picture only if real approval footage exists. Never film a phone scanning the replay QR: it encodes the GitHub URL. | "Both checks pass: under budget, every requirement covered. Now a human has to say yes. In the recorded run, a person approved with a passkey on Reap's own hosted page. The agent never sees the card." |
+| 1:52–2:20 | Door to plating: bag arrives, ghost plates turn solid. Caption: `COMPLETED · Order placed · delivery visualized` | "Reap reports COMPLETED, so the merchant order is placed. The bag arrives and the ghost plates turn solid, one per guest. Delivery is visualized; the sandbox ships nothing." |
+| 2:20–2:42 | Bill typewriter, receipt book, 3 s CSV insert. Board: charged S$102.75, variance S$0.00, order `ord_01M4G0J3JSEP31G7NASSA0K649`, 154 Reap calls. | "The bill is the treasurer's receipt: budget, charged amount, zero variance, the order reference, and a CSV." |
+| 2:42–3:00 | Wide, end card: sandbox / approval / built on Agent Arena lines, repo URL, team "The Greek Warriors" + TODO names. | "An organiser writes a brief and approves one payment. The agent can't overspend and leaves a receipt anyone can read by looking at the room. Agent Arena is existing work; we built the Reap purchasing, the gate, the record and the kitchen. That's CrewKit Kitchen." |
 
-Voiceover length: about 390 words, which fits 3:00 at a calm pace with room for the organiser clip. Cut the fallback VO if the organiser clip is used.
+Voiceover length: about 305 words (cap 330) at a calm pace. Cut the fallback VO in the first beat if the organiser clip is used.
 
 ## Disclosure lines (keep separate, never merge)
 
-1. **Sandbox:** "Live Reap Agentic API sandbox, SGD. No real money moved."
-2. **Approval:** if the phone shot is the real hosted page from this take, caption `Reap hosted approval (sandbox)`. If the take used `--mode simulate` (simulated approval) or `--mode replay` (recorded tape), caption that scene `Approval simulated in this take` or `Replayed from a recorded live run` instead, and do not show a phone.
-3. **Delivery:** `Order placed · delivery visualized` (Reap confirms the merchant order; no parcel is filmed).
-4. **Compressed time:** every speed-up carries `Wait shortened · real time [mm:ss]`.
-5. **Prior work:** "Agent Arena is existing work; today we built the Reap purchasing, the gate, the record and the kitchen."
+1. **Sandbox:** "Reap Agentic API sandbox, SGD. No real money moved."
+2. **Replay:** "Replayed from the recorded real sandbox run" on the whole demo.
+3. **Approval:** "Recorded from the real run: human passkey approval on Reap's hosted page (sandbox)". The simulate header was set in that run, but Reap still returned REQUIRES_ACTION and a human approved.
+4. **Delivery:** `COMPLETED · Order placed · delivery visualized` (Reap confirms the merchant order; no parcel is filmed).
+5. **Compressed time:** every speed-up carries `Wait shortened · real time <mm:ss>`.
+6. **Prior work:** "Agent Arena is existing work; we built the Reap purchasing, the gate, the record and the kitchen."
 
 ## Camera marks (`/ckcam go <mark>`)
 

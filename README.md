@@ -100,7 +100,7 @@ flowchart LR
 - The Minecraft agent platform underneath is **Agent Arena**, existing work by the project owner, published under MIT. Its docs are in [docs/AGENT-ARENA.md](docs/AGENT-ARENA.md).
 - **Built at the event:** the Reap purchasing client, the chef and its tools, the budget gate, the run record, the `crewkit_state` bridge message, the kitchen set, the visual choreography, and this documentation. Everything under `coordinator/src/crewkit/`, `src/main/java/dev/agaminggod/arenaagents/crewkit/`, and `docs/crewkit/` is new.
 - This runs against the **Reap sandbox**. No real money moves and nothing ships.
-- Two things are separate in a demo run. **Hosted approval** is a real human step on Reap's sandbox page. **Simulated completion** (`X-Simulate-Checkout: COMPLETED`, used in `simulate` mode) skips that step, and the run is labeled simulated.
+- Approval in the recorded run was a real human step. The `simulate` header (`X-Simulate-Checkout: COMPLETED`) was set, but Reap still returned `REQUIRES_ACTION` and a human approved with a passkey on Reap's sandbox hosted page. We do not claim that `simulate` mode skips approval.
 - CrewKit makes no onchain claims.
 
 ## Quick start
@@ -135,7 +135,7 @@ flowchart LR
 | Mode | What it does |
 |---|---|
 | `replay` | Plays a recorded run through the kitchen. No network. |
-| `simulate` | Calls the sandbox with `X-Simulate-Checkout: COMPLETED`. Completion is simulated. |
+| `simulate` | Calls the sandbox with `X-Simulate-Checkout: COMPLETED`. In the recorded run Reap still returned `REQUIRES_ACTION` and needed human approval. |
 | `live` | Full flow: sandbox card, hosted approval page, polling. Approval is a real human step. |
 
 Docs: [contract](docs/crewkit/CONTRACT.md), [brief and script](docs/crewkit/brief-and-script.md), [Reap API notes](docs/crewkit/reap-api-notes.md), [submission text](docs/crewkit/SUBMISSION.md), [judge Q&A](docs/crewkit/JUDGE-QA.md).

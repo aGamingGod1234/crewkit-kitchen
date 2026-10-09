@@ -60,7 +60,7 @@ Approval is not an order. The scene plays only when polling returns `COMPLETED`:
 
 ## Was the approval real in the demo?
 
-It depends on the mode, and we label it. In `live` mode a human approves on Reap's sandbox hosted page. In `simulate` mode we send `X-Simulate-Checkout: COMPLETED`, which does not involve the approval page, and the run is labeled simulated. We make no onchain claims.
+Yes, in the recorded run. The simulate header was set, but Reap still returned `REQUIRES_ACTION` and a human approved with a passkey on Reap's sandbox hosted page. The demo replays that run and is captioned as a replay. We make no onchain claims.
 
 ## What is live and what is choreographed?
 
@@ -96,3 +96,15 @@ Reap and Visa approval for production use, production keys, real merchants, and 
 ## What is next?
 
 Mandates with the budget as the ceiling, recurring team orders, finance-lead approval with per-person limits, a web view of the same state, and polished failure and expiry scenes.
+
+## Who wants this enough to pay?
+
+Student-club workshop organisers are our target. We demonstrated the workflow; we have not yet validated willingness to pay or repeat demand.
+
+## Why would an organiser install Minecraft to buy stationery?
+
+They wouldn't need to. Minecraft is the shared display for this demo; the engine is a plain Node service and a simple web view is the obvious next step.
+
+## Is this a shopping chatbot with a staged animation?
+
+No. The recorded sandbox run handled sold-out substitutions and our server blocked an over-budget checkout before a human approved with a passkey; the delivery scene only visualizes COMPLETED.
