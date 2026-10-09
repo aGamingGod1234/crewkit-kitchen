@@ -140,6 +140,10 @@ export async function runCrewkit({ brief: rawBrief, api, emit, enrollmentId, pol
   let lastTotal = null;
   const handleBlocked = async (gate, totals) => {
     if (gate.code === 'QUOTE_EXPIRED') { log(`quote expired, re-quoting: ${gate.reason}`); return null; }
+    if (gate.code === 'QUOTE_INVALID') {
+      emit('gate_blocked', { over: { amount: 0, currency: cur }, reason: gate.reason, code: gate.code });
+      return fail('failed', 'QUOTE_INVALID', gate.reason);
+    }
     if (gate.code === 'CURRENCY_MISMATCH') {
       emit('gate_blocked', { over: { amount: 0, currency: cur }, reason: gate.reason, code: gate.code });
       return fail('failed', 'CURRENCY_MISMATCH', gate.reason);
@@ -181,7 +185,7 @@ export async function runCrewkit({ brief: rawBrief, api, emit, enrollmentId, pol
       return fail('failed', e.code || 'QUOTE_ERROR', e.message);
     }
     let totals = quoteTotals(quote, cur);
-    emit('quote', { total: totals.total, budgetRemaining: { amount: r2(budget.amount - totals.total.amount), currency: cur }, shipping: totals.shipping, quoteId: totals.quoteId, expiresAt: totals.expiresAt });
+    if (!totals.invalid) emit('quote', { total: totals.total, budgetRemaining: { amount: r2(budget.amount - totals.total.amount), currency: cur }, shipping: totals.shipping, quoteId: totals.quoteId, expiresAt: totals.expiresAt });
     lastTotal = totals.total;
     let gate = evaluateGate({ totals, budget, now: now() });
     if (!gate.ok) { const stop = await handleBlocked(gate, totals); if (stop) return stop; continue; }
@@ -189,13 +193,14 @@ export async function runCrewkit({ brief: rawBrief, api, emit, enrollmentId, pol
     // Re-read right before checkout: shipping-inclusive total, currency, expiry.
     try {
       const fresh = await call('getQuote', quote.id);
-      totals = quoteTotals({ ...quote, ...fresh, id: fresh?.id ?? quote.id }, cur);
+      // Gate the fresh read on its own; never fill its gaps from the earlier quote.
+      totals = quoteTotals(fresh && typeof fresh === 'object' ? { ...fresh, id: fresh.id ?? quote.id } : fresh, cur);
     } catch (e) {
       if (REQUOTE_CODES.has(e.code)) continue;
       return fail('failed', e.code || 'QUOTE_ERROR', e.message);
     }
     if (totals.total.amount !== lastTotal.amount) {
-      emit('quote', { total: totals.total, budgetRemaining: { amount: r2(budget.amount - totals.total.amount), currency: cur }, shipping: totals.shipping, quoteId: totals.quoteId, expiresAt: totals.expiresAt });
+      if (!totals.invalid) emit('quote', { total: totals.total, budgetRemaining: { amount: r2(budget.amount - totals.total.amount), currency: cur }, shipping: totals.shipping, quoteId: totals.quoteId, expiresAt: totals.expiresAt });
       lastTotal = totals.total;
     }
     gate = evaluateGate({ totals, budget, now: now() });

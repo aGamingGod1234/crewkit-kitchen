@@ -22,7 +22,7 @@ const { createEventStream } = await import('../src/crewkit/events.mjs');
 const SGD = (amount) => ({ amount, currency: 'SGD' });
 const budget = SGD(150); // unit tests; the demo brief itself is S$190
 const future = new Date(Date.now() + 10 * 60_000).toISOString();
-const totals = (amount, extra = {}) => ({ quoteId: 'q', total: SGD(amount), shipping: SGD(4), subtotal: SGD(amount - 4), expiresAt: future, ...extra });
+const totals = (amount, extra = {}) => ({ quoteId: 'q', total: SGD(amount), shipping: SGD(4), subtotal: SGD(amount - 4), expiresAt: future, invalid: null, ...extra });
 const names = (events) => events.map((e) => e.event).filter((e) => e !== 'calls');
 
 test('gate passes at exactly the budget and blocks one cent over, shipping included', () => {
@@ -32,6 +32,46 @@ test('gate passes at exactly the budget and blocks one cent over, shipping inclu
   assert.deepEqual(g.over, SGD(0.01));
   const q = quoteTotals({ id: 'x', amountBreakdown: { itemsSubtotal: SGD(147), shipping: SGD(4), finalAmount: SGD(151) }, expiresAt: future }, 'SGD');
   assert.equal(evaluateGate({ totals: q, budget }).code, 'OVER_BUDGET', 'gate uses finalAmount, not the item subtotal');
+});
+
+test('finding 1: gate fails closed on a quote it cannot read exactly', () => {
+  const good = { id: 'q1', expiresAt: future, amountBreakdown: { finalAmount: SGD(100) } };
+  assert.deepEqual(evaluateGate({ totals: quoteTotals(good, 'SGD'), budget }), { ok: true });
+  const bad = {
+    'missing finalAmount': { ...good, amountBreakdown: {} },
+    'missing breakdown': { id: 'q1', expiresAt: future },
+    'string amount': { ...good, amountBreakdown: { finalAmount: { amount: '100', currency: 'SGD' } } },
+    'NaN amount': { ...good, amountBreakdown: { finalAmount: { amount: NaN, currency: 'SGD' } } },
+    'bare number, no currency': { ...good, amountBreakdown: { finalAmount: 100 } },
+    'missing currency': { ...good, amountBreakdown: { finalAmount: { amount: 100 } } },
+    'missing expiresAt': { ...good, expiresAt: undefined },
+    'invalid expiresAt': { ...good, expiresAt: 'soon' },
+    'missing id': { ...good, id: undefined },
+  };
+  for (const [label, quote] of Object.entries(bad)) {
+    assert.equal(evaluateGate({ totals: quoteTotals(quote, 'SGD'), budget }).code, 'QUOTE_INVALID', label);
+  }
+  assert.equal(evaluateGate({ totals: { ...totals(10), invalid: undefined }, budget }).code, 'QUOTE_INVALID', 'unchecked totals are not trusted');
+  assert.equal(evaluateGate({ totals: quoteTotals({ ...good, amountBreakdown: { finalAmount: { amount: 100, currency: 'USD' } } }, 'SGD'), budget }).code, 'CURRENCY_MISMATCH');
+});
+
+test('finding 1: a quote without finalAmount blocks with QUOTE_INVALID before any checkout', async () => {
+  const t = structuredClone(tape);
+  for (const e of t.entries) if (e.op === 'createQuote') delete e.response.amountBreakdown.finalAmount;
+  const { r, events } = await run(t);
+  assert.equal(r.status, 'QUOTE_INVALID');
+  const blocked = events.find((e) => e.event === 'gate_blocked');
+  assert.equal(blocked.data.code, 'QUOTE_INVALID');
+  assert.ok(!names(events).includes('checkout') && !names(events).includes('gate_passed') && !names(events).includes('quote'));
+});
+
+test('finding 1: the pre-checkout re-read is gated on its own, not merged with the first quote', async () => {
+  const t = structuredClone(tape);
+  const g = t.entries.find((e) => e.op === 'getQuote');
+  g.response = { id: g.response.id, amountBreakdown: g.response.amountBreakdown }; // expiresAt missing on the fresh read
+  const { r, events } = await run(t);
+  assert.equal(r.status, 'QUOTE_INVALID');
+  assert.ok(!names(events).includes('checkout'));
 });
 
 test('gate blocks a currency mismatch and an expired or nearly expired quote', () => {

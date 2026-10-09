@@ -17,21 +17,39 @@ export function quoteTotals(quote, currency) {
   const total = toMoney(b.finalAmount, currency);
   const shipping = toMoney(b.shipping, total.currency);
   const subtotal = toMoney(b.itemsSubtotal, total.currency);
-  return { quoteId: quote?.id, total, shipping, subtotal, expiresAt: quote?.expiresAt ?? null };
+  return { quoteId: quote?.id, total, shipping, subtotal, expiresAt: quote?.expiresAt ?? null, invalid: quoteDefect(quote) };
+}
+
+// Fail closed: a quote we cannot read exactly must never reach checkout.
+// Requires an id, a finite finalAmount with an explicit currency, and a parseable expiresAt.
+export function quoteDefect(quote) {
+  if (!quote || typeof quote !== 'object' || !quote.id) return 'quote has no id';
+  const fa = quote.amountBreakdown?.finalAmount;
+  if (!fa || typeof fa !== 'object') return 'quote has no amountBreakdown.finalAmount';
+  if (typeof fa.amount !== 'number' || !Number.isFinite(fa.amount) || fa.amount < 0) return `finalAmount.amount is not a finite number (${JSON.stringify(fa.amount)})`;
+  if (typeof fa.currency !== 'string' || !/^[A-Z]{3}$/.test(fa.currency)) return 'finalAmount has no explicit currency';
+  if (typeof quote.expiresAt !== 'string' || !Number.isFinite(Date.parse(quote.expiresAt))) return `quote expiresAt is missing or invalid (${JSON.stringify(quote.expiresAt)})`;
+  return null;
 }
 
 // Minimum time a quote must still be valid before we create a checkout from it.
 export const EXPIRY_MARGIN_MS = 20_000;
 
 /**
- * @returns {{ ok: true } | { ok: false, code: 'CURRENCY_MISMATCH'|'QUOTE_EXPIRED'|'OVER_BUDGET', reason: string, over?: {amount,currency} }}
+ * @returns {{ ok: true } | { ok: false, code: 'QUOTE_INVALID'|'CURRENCY_MISMATCH'|'QUOTE_EXPIRED'|'OVER_BUDGET', reason: string, over?: {amount,currency} }}
  */
 export function evaluateGate({ totals, budget, now = Date.now(), marginMs = EXPIRY_MARGIN_MS }) {
   const { total, expiresAt } = totals;
+  // totals.invalid is set by quoteTotals; a totals object without that check is treated as unverified.
+  if (totals.invalid !== null) {
+    return { ok: false, code: 'QUOTE_INVALID', reason: `Quote ${totals.quoteId ?? '?'} cannot be verified: ${totals.invalid ?? 'not checked by quoteTotals'}` };
+  }
+  const expiry = Date.parse(expiresAt);
+  if (!Number.isFinite(expiry)) return { ok: false, code: 'QUOTE_INVALID', reason: `Quote ${totals.quoteId} has no valid expiresAt` };
   if (total.currency !== budget.currency) {
     return { ok: false, code: 'CURRENCY_MISMATCH', reason: `Quote is in ${total.currency}, budget is in ${budget.currency}` };
   }
-  if (expiresAt && Date.parse(expiresAt) - now < marginMs) {
+  if (expiry - now < marginMs) {
     return { ok: false, code: 'QUOTE_EXPIRED', reason: `Quote ${totals.quoteId} expires at ${expiresAt}` };
   }
   if (total.amount > budget.amount) {
