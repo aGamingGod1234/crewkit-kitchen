@@ -3,16 +3,19 @@ import { createCrewkitController, startCrewkitHttp } from './http-trigger.mjs';
 
 let sink = () => {};
 let log = () => {};
-const controller = createCrewkitController({ sink: (p) => sink(p), log: (m) => log(m) });
+let speak = null;
+const controller = createCrewkitController({ sink: (p) => sink(p), log: (m) => log(m), speak: (line) => (speak ? speak(line) : false) });
 
 export const getCrewkitController = () => controller;
 
 /**
- * Called once from the coordinator CLI. sendState(payload) delivers a crewkit_state message to the mod.
+ * Called once from the coordinator CLI. sendState(payload) delivers a crewkit_state message to the mod;
+ * speakAsChef(line) says one proximity line as the Chef agent (false when Chef is not connected).
  * Starts the 127.0.0.1 HTTP trigger unless CREWKIT_HTTP=off.
  */
-export async function startCrewkitService({ sendState, logger = () => {} } = {}) {
+export async function startCrewkitService({ sendState, speakAsChef = null, logger = () => {} } = {}) {
   log = logger;
+  speak = speakAsChef;
   sink = (payload) => Promise.resolve(sendState?.(payload)).then((sent) => {
     if (sent === false) logger(`crewkit_state ${payload.event} #${payload.seq} not delivered: no server connected`);
   }).catch((e) => logger(`crewkit_state ${payload.event} #${payload.seq} send failed: ${e.code || e.message}`));

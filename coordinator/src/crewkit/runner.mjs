@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { runCrewkit, normalizeBrief } from './engine.mjs';
 import { createEventStream, ndjsonSink } from './events.mjs';
 import { liveApi, recordingApi, replayApi } from './tape.mjs';
+import { chefVoiceEnabled, createChefVoice } from './chef-voice.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = join(here, '..', '..', '..');
@@ -56,9 +57,9 @@ export function writeRecord({ runId, mode, brief, result, dir = RECORDS_DIR }) {
 /**
  * Start a run. Returns { runId, done } where done resolves to the result.
  * opts: mode, sinks[], tape (replay path or object), speed (replay latency scale), record (save tape in live/simulate),
- *       pollEveryMs, writeRecords
+ *       pollEveryMs, writeRecords, speak (Chef voice lines), chefVoice
  */
-export async function startRun(rawBrief, { mode = 'replay', sinks = [], bridgeSinks = [], tape = DEFAULT_TAPE, speed = 1, recordTape = true, pollEveryMs, writeRecords = true, log = () => {}, runId = `ck-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}` } = {}) {
+export async function startRun(rawBrief, { mode = 'replay', sinks = [], bridgeSinks = [], tape = DEFAULT_TAPE, speed = 1, recordTape = true, pollEveryMs, writeRecords = true, log = () => {}, speak = null, chefVoice = chefVoiceEnabled(), runId = `ck-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}` } = {}) {
   if (!MODES.includes(mode)) throw new TypeError(`mode must be one of ${MODES.join(', ')}`);
   const brief = normalizeBrief(rawBrief);
   let api; let enrollmentId;
@@ -75,7 +76,9 @@ export async function startRun(rawBrief, { mode = 'replay', sinks = [], bridgeSi
     if (recordTape) api = recordingApi(api, { note: `${mode} run ${runId}: ${brief.title}` });
   }
   const eventsFile = join(RECORDS_DIR, `${runId}.events.ndjson`);
-  const stream = createEventStream({ runId, sinks: [ndjsonSink(eventsFile), ...sinks], bridgeSinks });
+  // speak(line) says one proximity line as Chef; CREWKIT_CHEF_VOICE=0 or chefVoice:false turns it off.
+  const voice = speak && chefVoice ? [createChefVoice({ speak, log })] : [];
+  const stream = createEventStream({ runId, sinks: [ndjsonSink(eventsFile), ...sinks, ...voice], bridgeSinks });
   const done = (async () => {
     let result;
     try {

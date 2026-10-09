@@ -46,6 +46,7 @@ import { ProviderHealthRegistry } from './provider-health-registry.mjs';
 import { classifyRecoveryFailure } from './recovery-policy.mjs';
 import { ReportingTransitionDeduper } from './reporting-transition-deduper.mjs';
 import { NativeToolRuntime } from './native-tool-runtime.mjs';
+import { normalizeMinecraftToolCall } from './native-minecraft-tools.mjs';
 import { classifyNativeGoalError } from './native-goal-error-policy.mjs';
 import { MAX_GOAL_SPEC_CORRECTION_ATTEMPTS, fallbackCompiledDragonGoal, localGoalSpecFeedback } from './goal-spec-translator.mjs';
 import { ProgramRuntimeManager } from './program-runtime-manager.mjs';
@@ -203,6 +204,7 @@ export class DynamicCoordinator extends EventEmitter {
 	#serverInstanceId = null;
 	#connectionEpoch = 0;
 	#connected = false;
+	#crewkitVoiceCalls = 0;
 	#readyRegistry = [];
 	#providerRecoveryPending = false;
 	#traceWriter;
@@ -375,6 +377,28 @@ export class DynamicCoordinator extends EventEmitter {
 		if (!this.#connected) return false;
 		await this.#sendForEpoch(this.#connectionEpoch, 'crewkit_state', 'server', payload);
 		return true;
+	}
+
+	// CrewKit Kitchen: the Chef says one line in proximity chat through the same native path as the say tool,
+	// so the voice add-on speaks it. False when no server, no Chef agent or no native tool loop; never throws.
+	async speakAsAgentNamed(name, message) {
+		try {
+			if (!this.#connected) return false;
+			const record = this.#registry.list().find((entry) => entry.name === name);
+			if (record === undefined || !this.#usesNativeTools(record)) return false;
+			// Bind the line to the live connection, as a player message wake does; an idle Chef may not have been observed yet.
+			this.#nativeRuntimeEpochs.set(record.agentId, this.#connectionEpoch);
+			const id = `crewkit-voice-${++this.#crewkitVoiceCalls}`;
+			const tool = normalizeMinecraftToolCall('say', { message, audience: 'proximity' });
+			const execution = this.#nativeRuntime.execute({ agentId: record.agentId, goalRevision: record.goalRevision, turnId: id, callId: id, tool }, record);
+			execution.catch(() => {});
+			let timer;
+			const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve(null), 8_000); timer.unref?.(); });
+			const result = await Promise.race([execution, timeout]).finally(() => clearTimeout(timer));
+			return result?.state === 'SUCCEEDED';
+		} catch {
+			return false; // Chef busy talking, not loaded, or mid goal change: drop the line
+		}
 	}
 
 	/**
@@ -3949,7 +3973,7 @@ async function runCli(reporter = new RuntimeErrorReporter()) {
 		// CrewKit Kitchen: local run trigger + crewkit_state delivery. Optional; never blocks coordinator start.
 		try {
 			const { startCrewkitService } = await import('./crewkit/service.mjs');
-			await startCrewkitService({ sendState: (payload) => coordinator.sendCrewkitState(payload), logger: (message) => process.stderr.write(`[crewkit] ${message}\n`) });
+			await startCrewkitService({ sendState: (payload) => coordinator.sendCrewkitState(payload), speakAsChef: (line) => coordinator.speakAsAgentNamed('Chef', line), logger: (message) => process.stderr.write(`[crewkit] ${message}\n`) });
 		} catch (crewkitError) { process.stderr.write(`[crewkit] trigger unavailable: ${crewkitError.message}\n`); }
 	} catch (error) {
 		await Promise.allSettled([coordinator.stop(), voiceSupervisor.close(), protocolAudit?.close()]);

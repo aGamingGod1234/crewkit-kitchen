@@ -10,7 +10,7 @@ import { DEFAULT_BRIEF, MODES, startRun } from './runner.mjs';
 export const DEFAULT_CREWKIT_PORT = 4777;
 
 /** One run at a time; shared by the HTTP trigger and the crewkit_shop agent tool. */
-export function createCrewkitController({ sink = () => {}, log = () => {} } = {}) {
+export function createCrewkitController({ sink = () => {}, log = () => {}, speak = null } = {}) {
   let active = null;
   let last = null;
   return {
@@ -23,7 +23,7 @@ export function createCrewkitController({ sink = () => {}, log = () => {} } = {}
       let run;
       try {
         run = await startRun(brief ?? JSON.parse(readFileSync(DEFAULT_BRIEF, 'utf8')), {
-          mode, bridgeSinks: [sink], log, ...(speed !== undefined ? { speed: Number(speed) } : {}), ...(typeof tape === 'string' && tape.endsWith('.tape.json') ? { tape } : {}),
+          mode, bridgeSinks: [sink], log, speak, ...(speed !== undefined ? { speed: Number(speed) } : {}), ...(typeof tape === 'string' && tape.endsWith('.tape.json') ? { tape } : {}),
         });
       } catch (e) { active = null; e.status ??= 400; throw e; }
       active = { runId: run.runId, mode, startedAt: Date.now() };

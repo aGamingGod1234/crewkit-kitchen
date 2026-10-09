@@ -279,6 +279,23 @@ test('coordinator sends crewkit_state to the server over the bridge', async () =
   } finally { await run.coordinator.stop(); }
 });
 
+test('coordinator speaks a Chef line through the say path as proximity chat; no Chef means false', async () => {
+  const { start, record, eventually } = await import('./fixtures/dynamic-main-fixture.mjs');
+  const config = { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } };
+  const run = await start({ config, initialRegistry: [{ ...record('chef-1'), name: 'Chef' }] });
+  run.bridge.acknowledgeActionResult = async () => {};
+  try {
+    assert.equal(await run.coordinator.speakAsAgentNamed('Nobody', 'hi'), false);
+    const spoken = run.coordinator.speakAsAgentNamed('Chef', 'Order placed! Plating up.');
+    await eventually(() => run.bridge.sent.some((m) => m.type === 'action_command'));
+    const cmd = run.bridge.sent.find((m) => m.type === 'action_command');
+    assert.equal(cmd.agentId, 'chef-1');
+    assert.deepEqual([cmd.payload.actionType, cmd.payload.arguments], ['chat', { message: 'Order placed! Plating up.', audience: 'proximity' }]);
+    run.bridge.emit('action_result', { agentId: 'chef-1', payload: { goalRevision: 0, actionId: cmd.payload.actionId, actionType: 'chat', state: 'SUCCEEDED', reasonCode: 'CHAT_SENT', eventSequence: 1 } });
+    assert.equal(await spoken, true);
+  } finally { await run.coordinator.stop(); }
+});
+
 test('finding 3: checkout idempotency key is persisted per quote before sending and survives 409 IN_PROGRESS', async () => {
   const stateFile = path.join(process.env.CREWKIT_RECORDS_DIR, 'state-test.json');
   const saved = { key: process.env.REAP_API_KEY, state: process.env.CREWKIT_STATE_FILE, fetch: globalThis.fetch };
@@ -357,4 +374,57 @@ test('the committed real Reap tape replays the 6-guest brief to the recorded ord
   const ev = r.events.map((e) => e.event);
   assert.ok(ev.indexOf('gate_blocked') < ev.indexOf('gate_passed'), 'first quote over budget, then passes');
   assert.ok(r.events.some((e) => e.event === 'item_removed' && e.data.why === 'sold_out'), 'sold-out beat present');
+});
+
+test('chef voice: event-built lines at each beat, once each, 6 s apart, dropped while busy', async () => {
+  const { createChefVoice, words } = await import('../src/crewkit/chef-voice.mjs');
+  assert.equal(words(105), 'a hundred and five');
+  let t = 0;
+  const lines = [];
+  const voice = createChefVoice({ speak: async (l) => { lines.push(l); return true; }, now: () => t });
+  const tick = async (ms) => { t += ms; await new Promise((r) => setImmediate(r)); };
+  voice({ event: 'brief', data: { guests: Array(6).fill({ name: 'g' }), budget: SGD(105) } }); await tick(7000);
+  voice({ event: 'item_added', data: { id: 'notebook', realName: 'Campap A5 Ruled Exercise Book 80 pages' } });
+  voice({ event: 'gate_blocked', data: { over: SGD(4.5) } }); await tick(1000);
+  voice({ event: 'gate_blocked', data: { over: SGD(2) } }); // second block: never repeated
+  voice({ event: 'item_removed', data: { id: 'notebook', why: 'sold_out' } }); // within 6 s: dropped
+  await tick(7000);
+  voice({ event: 'checkout', data: {} }); await tick(7000);
+  voice({ event: 'completed', data: {} }); await tick(0);
+  assert.deepEqual(lines, ['Order in! Six guests, a hundred and five dollar budget.', 'We\'re five dollars over. Swapping to cheaper picks, nobody loses a seat.',
+    'Scan to approve, I won\'t buy without you.', 'Order placed! Plating up.']);
+  assert.ok(lines.every((l) => l.split(/\s+/).length <= 15));
+  const busy = [];
+  let release;
+  const slow = createChefVoice({ speak: (l) => { busy.push(l); return new Promise((r) => { release = r; }); }, now: () => t, minGapMs: 0 });
+  slow({ event: 'checkout', data: {} }); await tick(0);
+  slow({ event: 'completed', data: {} }); await tick(0);
+  release(true);
+  assert.deepEqual(busy, ['Scan to approve, I won\'t buy without you.'], 'a line in flight drops the next');
+  const sold = [];
+  const s2 = createChefVoice({ speak: async (l) => { sold.push(l); return false; }, now: () => 0 });
+  s2({ event: 'item_added', data: { id: 'pen', realName: 'Pilot G-2 Gel Pen 0.7mm Blue' } });
+  s2({ event: 'item_removed', data: { id: 'pen', why: 'sold_out' } }); await tick(0);
+  assert.deepEqual(sold, ['Pilot G-2 Gel Pen is sold out, grabbing another.'], 'no Chef connected: speak false is silently skipped');
+});
+
+test('chef voice runs from the runner on the real tape and CREWKIT_CHEF_VOICE=0 turns it off', async () => {
+  const brief6 = JSON.parse(readFileSync(path.join(fixtures, 'demo-brief-6.json'), 'utf8'));
+  const lines = [];
+  const speak = async (l) => { lines.push(l); return true; };
+  const r = await (await startRun(brief6, { mode: 'replay', speed: 0, writeRecords: false, speak, chefVoice: true })).done;
+  assert.equal(r.status, 'COMPLETED');
+  assert.ok(lines[0].startsWith('Order in! Six guests, a hundred and five dollar budget'), lines[0]);
+  assert.ok(lines.length >= 1 && lines.length <= 5);
+  const thrown = await (await startRun(brief6, { mode: 'replay', speed: 0, writeRecords: false, speak: () => { throw new Error('no chef'); }, chefVoice: true })).done;
+  assert.equal(thrown.status, 'COMPLETED', 'a failing voice never stops the run');
+  const saved = process.env.CREWKIT_CHEF_VOICE;
+  process.env.CREWKIT_CHEF_VOICE = '0';
+  try {
+    const off = [];
+    await (await startRun(brief6, { mode: 'replay', speed: 0, writeRecords: false, speak: async (l) => { off.push(l); return true; } })).done;
+    assert.deepEqual(off, []);
+  } finally {
+    if (saved === undefined) delete process.env.CREWKIT_CHEF_VOICE; else process.env.CREWKIT_CHEF_VOICE = saved;
+  }
 });
