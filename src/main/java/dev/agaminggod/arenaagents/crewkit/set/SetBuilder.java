@@ -83,6 +83,7 @@ public final class SetBuilder {
 		CrewkitAnchors.origin = origin.immutable();
 		data.update(origin.immutable(), dimension, true, palette, snapshot);
 		int placed = new Placer(level, origin).placeAll();
+		data.nextGeneration();
 		spawnMarkers(level);
 		return placed;
 	}
@@ -107,6 +108,7 @@ public final class SetBuilder {
 			}
 		}
 		data.update(origin, data.dimension, false, List.of(), new int[0]);
+		data.nextGeneration(); // markers left in unloaded chunks become stale
 		return true;
 	}
 
@@ -136,6 +138,18 @@ public final class SetBuilder {
 
 	// ---- markers ----
 
+	static String generationTag(int generation) {
+		return "ck_set_gen_" + generation;
+	}
+
+	/** Entity load hook: drop set markers from an older build (e.g. saved in a chunk that was unloaded at teardown). */
+	static void discardIfStale(Entity entity, ServerLevel level) {
+		if (!entity.entityTags().contains(SET_TAG)) return;
+		SetSavedData data = SetSavedData.get(level.getServer());
+		if (data.built && entity.entityTags().contains(generationTag(data.generation))) return;
+		level.getServer().execute(entity::discard);
+	}
+
 	private static void spawnMarkers(ServerLevel level) {
 		killMarkers(level);
 		for (Object[] row : MARKERS) {
@@ -148,6 +162,7 @@ public final class SetBuilder {
 			marker.snapTo(pos.x, pos.y, pos.z, camera ? 180.0F : 0.0F, camera ? 25.0F : 0.0F);
 			marker.addTag(SET_TAG);
 			marker.addTag(tag);
+			marker.addTag(generationTag(SetSavedData.get(level.getServer()).generation));
 			level.addFreshEntity(marker);
 		}
 	}

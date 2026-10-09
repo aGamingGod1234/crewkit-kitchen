@@ -25,7 +25,8 @@ public final class SetSavedData extends SavedData {
 			Codec.STRING.optionalFieldOf("dimension", "minecraft:overworld").forGetter(data -> data.dimension),
 			Codec.BOOL.optionalFieldOf("built", false).forGetter(data -> data.built),
 			BlockState.CODEC.listOf().optionalFieldOf("snapshot_palette", List.of()).forGetter(data -> data.palette),
-			INT_ARRAY.optionalFieldOf("snapshot", new int[0]).forGetter(data -> data.snapshot)
+			INT_ARRAY.optionalFieldOf("snapshot", new int[0]).forGetter(data -> data.snapshot),
+			Codec.INT.optionalFieldOf("generation", 0).forGetter(data -> data.generation)
 	).apply(instance, SetSavedData::new));
 	public static final SavedDataType<SetSavedData> TYPE = new SavedDataType<>(
 			Identifier.fromNamespaceAndPath("arenaagents", "crewkit_set"),
@@ -39,12 +40,15 @@ public final class SetSavedData extends SavedData {
 	boolean built;
 	List<BlockState> palette = List.of();
 	int[] snapshot = new int[0];
+	/** Bumped on every build; markers carry it so stale ones from unloaded chunks can be dropped on load. */
+	int generation;
 
 	public SetSavedData() {
 	}
 
-	private SetSavedData(Optional<BlockPos> origin, String dimension, boolean built, List<BlockState> palette, int[] snapshot) {
+	private SetSavedData(Optional<BlockPos> origin, String dimension, boolean built, List<BlockState> palette, int[] snapshot, int generation) {
 		this.origin = origin.orElse(null);
+		this.generation = generation;
 		this.dimension = dimension;
 		this.built = built;
 		this.palette = List.copyOf(palette);
@@ -70,5 +74,11 @@ public final class SetSavedData extends SavedData {
 		this.palette = List.copyOf(palette);
 		this.snapshot = snapshot;
 		setDirty();
+	}
+
+	int nextGeneration() {
+		generation++;
+		setDirty();
+		return generation;
 	}
 }
