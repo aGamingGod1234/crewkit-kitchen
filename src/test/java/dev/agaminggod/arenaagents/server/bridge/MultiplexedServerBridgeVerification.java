@@ -3307,7 +3307,7 @@ public final class MultiplexedServerBridgeVerification {
 		}
 	}
 
-	private static CodexAgentManager uninitializedManager() {
+	static CodexAgentManager uninitializedManager() {
 		try {
 			Field field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
 			field.setAccessible(true);

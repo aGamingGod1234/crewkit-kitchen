@@ -24,6 +24,7 @@ public final class NavigationMotionVerification {
 		verifyEasedTurning();
 		verifyLookController();
 		verifySteering();
+		verifyClearWalkLineScratchEquivalence();
 		verifyOccupiedNode();
 		verifyJumps();
 		verifyGaze();
@@ -268,6 +269,49 @@ public final class NavigationMotionVerification {
 		withStep.set(2, new PathNode(withStep.get(2).position(), TraversalType.JUMP_UP));
 		assertEquals(-1, ServerNavigationController.occupiedWalkNode(withStep, 1, stairs.get(3).position()),
 				"a jump node is never skipped");
+	}
+
+	private static void verifyClearWalkLineScratchEquivalence() {
+		try {
+			var optimized = ServerNavigationController.class.getDeclaredMethod("clearWalkLineWithScratch",
+					WalkabilityView.class, Vec3.class, Vec3.class, int.class, long[].class);
+			optimized.setAccessible(true);
+			java.util.Random random = new java.util.Random(0x5EEDC1EAFL);
+			long[] scratch = new long[8];
+			for (int sample = 0; sample < 5_000; sample++) {
+				Set<Long> walkable = new HashSet<>();
+				for (int x = -14; x <= 14; x++) for (int z = -14; z <= 14; z++) {
+					if (random.nextDouble() < 0.76D) walkable.add(key(x, z));
+				}
+				Vec3 from = new Vec3(random.nextDouble() * 18.0D - 9.0D, LEVEL, random.nextDouble() * 18.0D - 9.0D);
+				Vec3 to = new Vec3(random.nextDouble() * 18.0D - 9.0D, LEVEL, random.nextDouble() * 18.0D - 9.0D);
+				boolean expected = referenceClearWalkLine(world(walkable), from, to, LEVEL);
+				boolean actual = (boolean) optimized.invoke(null, world(walkable), from, to, LEVEL, scratch);
+				assertEquals(expected, actual, "scratch ring preserves clearWalkLine answer for seeded random path " + sample);
+			}
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("clearWalkLine must expose the reusable scratch-ring implementation", exception);
+		}
+	}
+
+	private static boolean referenceClearWalkLine(WalkabilityView world, Vec3 from, Vec3 to, int level) {
+		double dx = to.x - from.x;
+		double dz = to.z - from.z;
+		int samples = Math.max(1, (int) Math.ceil(Math.sqrt(dx * dx + dz * dz) / ServerNavigationController.STEERING_SAMPLE_SPACING));
+		Set<GridPosition> checked = new HashSet<>();
+		for (int sample = 0; sample <= samples; sample++) {
+			double t = (double) sample / samples;
+			double x = from.x + dx * t;
+			double z = from.z + dz * t;
+			for (int corner = 0; corner < 4; corner++) {
+				GridPosition cell = new GridPosition(
+						(int) Math.floor(x + ((corner & 1) == 0 ? -ServerNavigationController.STEERING_HALF_WIDTH : ServerNavigationController.STEERING_HALF_WIDTH)),
+						level,
+						(int) Math.floor(z + ((corner & 2) == 0 ? -ServerNavigationController.STEERING_HALF_WIDTH : ServerNavigationController.STEERING_HALF_WIDTH)));
+				if (checked.add(cell) && world.traversalAt(cell) != TraversalType.WALK) return false;
+			}
+		}
+		return true;
 	}
 
 	private static void verifyJumps() {

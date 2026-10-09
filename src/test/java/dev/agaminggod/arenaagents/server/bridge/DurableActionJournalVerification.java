@@ -12,6 +12,7 @@ import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionState;
 import java.io.IOException;
 import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -32,6 +33,8 @@ public final class DurableActionJournalVerification {
 		AgentId agentId = AgentId.random();
 		UUID goalId = UUID.randomUUID();
 		ServerActionRequest request = request(agentId, 8L, "action-accepted", "step-accepted", 1L);
+		verifyTickGroupCommit(directory, agentId, goalId);
+		verifyCrashBoundaries(directory);
 
 		DurableActionJournal accepted = DurableActionJournal.open(path);
 		accepted.accept(request, goalId);
@@ -174,7 +177,135 @@ public final class DurableActionJournalVerification {
 		} catch (IOException exception) {
 			throw new AssertionError(exception);
 		}
-		return 46;
+		return 61;
+	}
+
+	private static void verifyCrashBoundaries(Path directory) {
+		AgentId crashAgent = AgentId.parse("00000000-0000-4000-8000-000000000991");
+		UUID crashGoal = UUID.fromString("00000000-0000-4000-8000-000000000992");
+		Path acceptPath = directory.resolve("crash-before-force.journal");
+		Path acceptMarker = directory.resolve("crash-before-force.marker");
+		ServerActionRequest acceptedBeforeCrash = request(crashAgent, 31L, "crash-accept", "crash-accept-step", 1L);
+		ServerActionRequest seed = request(crashAgent, 30L, "crash-seed", "crash-seed-step", 2L);
+		try (DurableActionJournal journal = DurableActionJournal.open(acceptPath)) {
+			journal.accept(seed, crashGoal);
+		}
+		int acceptExit = runCrashWorker("before-force", acceptPath, acceptMarker);
+		if (acceptExit != DurableActionJournalCrashWorker.BEFORE_FORCE_EXIT) {
+			throw new AssertionError("crash worker did not halt between frame write and force: " + acceptExit
+					+ "; " + readCrashWorkerOutput(acceptPath));
+		}
+		if (Files.exists(acceptMarker)) throw new AssertionError("an accepted action executed before its journal force");
+		try (DurableActionJournal recovered = DurableActionJournal.open(acceptPath)) {
+			DurableActionJournal.Entry maybeAccepted = recovered.snapshot().stream()
+					.filter(entry -> entry.request().actionId().equals(acceptedBeforeCrash.actionId())).findFirst().orElse(null);
+			if (maybeAccepted != null && maybeAccepted.phase() != DurableActionJournal.Phase.ACCEPTED) {
+				throw new AssertionError("pre-force crash replay produced a terminal result for an unexecuted action");
+			}
+		}
+
+		Path terminalPath = directory.resolve("crash-after-force.journal");
+		Path sendMarker = directory.resolve("crash-after-force.marker");
+		ServerActionRequest terminalRequest = request(crashAgent, 32L, "crash-terminal", "crash-terminal-step", 3L);
+		try (DurableActionJournal journal = DurableActionJournal.open(terminalPath)) {
+			journal.accept(terminalRequest, crashGoal);
+		}
+		int terminalExit = runCrashWorker("after-force", terminalPath, sendMarker);
+		if (terminalExit != DurableActionJournalCrashWorker.AFTER_FORCE_EXIT) {
+			throw new AssertionError("crash worker did not halt after force and before send: " + terminalExit
+					+ "; " + readCrashWorkerOutput(terminalPath));
+		}
+		if (Files.exists(sendMarker)) throw new AssertionError("result was sent before the post-force callback");
+		try (DurableActionJournal replayed = DurableActionJournal.open(terminalPath)) {
+			assertEntry(replayed, DurableActionJournal.Phase.TERMINAL, terminalRequest, result(terminalRequest, "DONE"));
+		}
+	}
+
+	private static String readCrashWorkerOutput(Path journal) {
+		try {
+			return Files.readString(journal.resolveSibling(journal.getFileName() + ".worker.log"));
+		} catch (IOException exception) {
+			return "worker output unavailable: " + exception.getMessage();
+		}
+	}
+
+	private static int runCrashWorker(String mode, Path journal, Path marker) {
+		Path argumentFile = journal.resolveSibling(journal.getFileName() + ".args");
+		Path outputFile = journal.resolveSibling(journal.getFileName() + ".worker.log");
+		String runtimeClassPath = System.getProperty("java.class.path").replace("\r", "").replace("\n", "");
+		String gsonJar = java.util.Arrays.stream(runtimeClassPath.split(java.util.regex.Pattern.quote(java.io.File.pathSeparator)))
+				.filter(entry -> entry.endsWith("gson-2.13.2.jar")).findFirst()
+				.orElseThrow(() -> new AssertionError("could not find Gson on the verification classpath"));
+		String classPath = (Path.of("build", "classes", "java", "test").toAbsolutePath() + java.io.File.pathSeparator
+				+ Path.of("build", "classes", "java", "main").toAbsolutePath() + java.io.File.pathSeparator + gsonJar)
+				.replace('\\', '/');
+		String journalArgument = journal.toAbsolutePath().normalize().toString().replace('\\', '/');
+		String markerArgument = marker.toAbsolutePath().normalize().toString().replace('\\', '/');
+		String arguments = "-cp " + classPath + "\r\n"
+				+ DurableActionJournalCrashWorker.class.getName() + "\r\n"
+				+ mode + "\r\n" + journalArgument + "\r\n" + markerArgument + "\r\n";
+		try {
+			Files.writeString(argumentFile, arguments, StandardCharsets.UTF_8);
+			String executable = System.getProperty("os.name", "").startsWith("Windows") ? "java.exe" : "java";
+			Path javaExecutable = Path.of(System.getProperty("java.home"), "bin", executable);
+			Process process = new ProcessBuilder(javaExecutable.toString(), "@" + argumentFile.toAbsolutePath())
+					.redirectErrorStream(true).redirectOutput(outputFile.toFile()).start();
+			if (!process.waitFor(30L, java.util.concurrent.TimeUnit.SECONDS)) {
+				process.destroyForcibly();
+				process.waitFor();
+				throw new AssertionError("journal crash worker timed out; see " + outputFile);
+			}
+			return process.exitValue();
+		} catch (InterruptedException exception) {
+			Thread.currentThread().interrupt();
+			throw new AssertionError("could not run journal crash worker", exception);
+		} catch (IOException exception) {
+			throw new AssertionError("could not run journal crash worker", exception);
+		}
+	}
+
+	private static void verifyTickGroupCommit(Path directory, AgentId agentId, UUID goalId) {
+		Path path = directory.resolve("tick-group.journal");
+		ServerActionRequest first = request(agentId, 20L, "tick-first", "tick-step-first", 1L);
+		ServerActionRequest second = request(agentId, 20L, "tick-second", "tick-step-second", 2L);
+		ServerActionRequest third = request(agentId, 21L, "tick-third", "tick-step-third", 3L);
+		try (DurableActionJournal journal = DurableActionJournal.open(path)) {
+			journal.acceptForTick(first, goalId);
+			journal.acceptForTick(second, goalId);
+			if (!journal.snapshot().isEmpty()) throw new AssertionError("Staged acceptances are not visible as durable journal state");
+			if (journal.stagedAcceptances().size() != 2) throw new AssertionError("Both staged acceptances are reported as not yet durable");
+			if (journal.performanceSnapshotForVerification().appendCount() != 0L) {
+				throw new AssertionError("Staging actions must not write or force the journal");
+			}
+			journal.flushTickGroup();
+			if (journal.performanceSnapshotForVerification().appendCount() != 1L) {
+				throw new AssertionError("Two accepted actions in one tick must share one journal force");
+			}
+			if (!journal.stagedAcceptances().isEmpty()) throw new AssertionError("A forced acceptance is no longer staged");
+			journal.flushTickGroup();
+			if (journal.performanceSnapshotForVerification().appendCount() != 1L) {
+				throw new AssertionError("A flush with nothing staged must not write or force");
+			}
+			assertContainsEntry(journal, DurableActionJournal.Phase.ACCEPTED, first, null);
+			assertContainsEntry(journal, DurableActionJournal.Phase.ACCEPTED, second, null);
+
+			ServerActionResult terminal = result(first, "DONE");
+			if (!journal.terminalIfAcceptedForTick(terminal)) throw new AssertionError("A durable acceptance must stage its terminal result");
+			journal.flushTickGroup();
+			if (journal.performanceSnapshotForVerification().appendCount() != 2L) {
+				throw new AssertionError("A terminal result group must append and force once");
+			}
+			assertContainsEntry(journal, DurableActionJournal.Phase.TERMINAL, first, terminal);
+
+			journal.queueAcknowledgement(agentId, first.goalRevision(), first.actionId());
+			journal.acceptForTick(third, goalId);
+			journal.flushTickGroup();
+			if (journal.performanceSnapshotForVerification().appendCount() != 3L) {
+				throw new AssertionError("An acceptance and its tick's ACK must share one journal force");
+			}
+			assertContainsEntry(journal, DurableActionJournal.Phase.ACKNOWLEDGED, first, terminal);
+			assertContainsEntry(journal, DurableActionJournal.Phase.ACCEPTED, third, null);
+		}
 	}
 
 	private static void verifyFailedAppendPreservesPhase(Path directory, AgentId agentId, UUID goalId) {
@@ -345,6 +476,20 @@ public final class DurableActionJournalVerification {
 		DurableActionJournal.Entry entry = journal.snapshot().get(0);
 		if (entry.phase() != phase || !entry.request().equals(request) || !java.util.Objects.equals(entry.result(), result)) {
 			throw new AssertionError("Journal entry did not survive the crash-boundary reload");
+		}
+	}
+
+	private static void assertContainsEntry(
+			DurableActionJournal journal,
+			DurableActionJournal.Phase phase,
+			ServerActionRequest request,
+			ServerActionResult result
+	) {
+		DurableActionJournal.Entry entry = journal.snapshot().stream()
+				.filter(candidate -> candidate.request().actionId().equals(request.actionId())).findFirst()
+				.orElseThrow(() -> new AssertionError("Journal entry was not persisted"));
+		if (entry.phase() != phase || !entry.request().equals(request) || !java.util.Objects.equals(entry.result(), result)) {
+			throw new AssertionError("Journal entry did not survive the tick group");
 		}
 	}
 

@@ -6,6 +6,7 @@ import java.lang.reflect.Method;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -68,6 +69,7 @@ public final class ServerObservationRayTargetVerification {
 			net.minecraft.server.Bootstrap.bootStrap();
 			Field f = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
 			f.setAccessible(true); unsafe = (sun.misc.Unsafe) f.get(null);
+			verifyAirRaySkipEquivalence();
 			rawMethod = ServerObservationCollector.class.getDeclaredMethod("rawSpatialObservation", ServerLevel.class, ServerPlayer.class, BlockPos.class);
 			sampleMethod = ServerObservationCollector.class.getDeclaredMethod("visibleSurfaceCandidates", ServerLevel.class, ServerPlayer.class, BlockPos.class);
 			rawMethod.setAccessible(true); sampleMethod.setAccessible(true);
@@ -77,6 +79,66 @@ public final class ServerObservationRayTargetVerification {
 			checkCase("above_local_scan", new BlockPos(2,68,0), false, true, true);
 			checkCase("local_corner_preserved", new BlockPos(6,64,6), true, true, false);
 			return assertions;
+		}
+
+		static void verifyAirRaySkipEquivalence() throws Exception {
+			SparseWorld world = new SparseWorld();
+			FixtureLevel contextLevel = (FixtureLevel) unsafe.allocateInstance(FixtureLevel.class);
+			contextLevel.world = world;
+			contextLevel.loaded = true;
+			FixturePlayer contextPlayer = (FixturePlayer) unsafe.allocateInstance(FixturePlayer.class);
+			contextPlayer.fixtureLevel = contextLevel;
+			set(contextPlayer, "position", new Vec3(0.5D, 64.0D, 0.5D));
+			set(contextPlayer, "blockPosition", new BlockPos(0, 64, 0));
+			set(contextPlayer, "eyeHeight", 1.62F);
+			BlockState[] shapes = {
+					Blocks.STONE.defaultBlockState(), Blocks.WATER.defaultBlockState(), Blocks.LAVA.defaultBlockState(),
+					Blocks.OAK_SLAB.defaultBlockState(), Blocks.OAK_FENCE.defaultBlockState(),
+					Blocks.END_PORTAL.defaultBlockState(), Blocks.END_GATEWAY.defaultBlockState(),
+					Blocks.TORCH.defaultBlockState(), Blocks.GLASS.defaultBlockState()
+			};
+			for (int index = 0; index < shapes.length; index++) {
+				world.states.put(new BlockPos(0, 64, index - 4), shapes[index]);
+			}
+			Random random = new Random(0xA17C1A1L);
+			for (int index = 0; index < 350; index++) {
+				BlockPos position = new BlockPos(random.nextInt(49) - 24, random.nextInt(21) + 56,
+						random.nextInt(49) - 24);
+				world.states.put(position, shapes[random.nextInt(shapes.length)]);
+			}
+			int raysWithNonAir = 0;
+			int raysWithoutNonAir = 0;
+			for (int index = 0; index < 5_000; index++) {
+				Vec3 start = new Vec3(random.nextDouble() * 48.0D - 24.0D,
+						random.nextDouble() * 22.0D + 55.5D, random.nextDouble() * 48.0D - 24.0D);
+				Vec3 end = new Vec3(random.nextDouble() * 48.0D - 24.0D,
+						random.nextDouble() * 22.0D + 55.5D, random.nextDouble() * 48.0D - 24.0D);
+				ClipContext context = new ClipContext(start, end, ClipContext.Block.VISUAL, ClipContext.Fluid.ANY, contextPlayer);
+				BlockHitResult vanilla = world.clip(context);
+				boolean candidate = ServerObservationCollector.rayContainsNonAir(start, end, context,
+						position -> !world.getBlockState(position).isAir());
+				if (candidate) {
+					raysWithNonAir++;
+					assertSameBlockHit(vanilla, world.clip(context), "ray (" + index + ") with a non-air cell");
+				} else {
+					raysWithoutNonAir++;
+					if (vanilla.getType() != HitResult.Type.MISS) {
+						throw new AssertionError("air-only ray skipped a vanilla block hit at sample " + index);
+					}
+				}
+			}
+			if (raysWithNonAir < 500 || raysWithoutNonAir < 500) {
+				throw new AssertionError("random rays did not cover both skip and clip paths: nonAir="
+						+ raysWithNonAir + ", air=" + raysWithoutNonAir);
+			}
+		}
+
+		static void assertSameBlockHit(BlockHitResult expected, BlockHitResult actual, String label) {
+			assertEquals(expected.getType(), actual.getType(), label + " hit type");
+			if (expected.getType() != HitResult.Type.BLOCK) return;
+			assertEquals(expected.getBlockPos(), actual.getBlockPos(), label + " hit position");
+			assertEquals(expected.getDirection(), actual.getDirection(), label + " hit face");
+			assertEquals(expected.getLocation(), actual.getLocation(), label + " hit location");
 		}
 		static void checkCase(String name, BlockPos target, boolean expectRaw, boolean expectSample, boolean expectReach) throws Exception {
 			SparseWorld world = new SparseWorld();

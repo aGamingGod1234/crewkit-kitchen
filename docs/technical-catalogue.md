@@ -459,3 +459,11 @@ Notes: before numbers come from the recorded GPT-6.1 Sol "beat the game" session
 - **Solution:** Tests now wait for the real event, or run on a shared virtual clock where time only moves when the test moves it, and every remaining limit is a budget that only bounds a failure. Two real bugs surfaced on the way and were fixed: the Windows permission check ran whichever `whoami` came first on the path, which was Git's, and one history test's sleep let a message be delivered twice. The same treatment was applied to the tests added earlier in this speed run, such as the tool-dispatch trace, the held-back post-result request and the rotation and steer tests.
 - **Result:** (measured) under heavy load the suite went from 17 failures and 18 cancelled tests to 0 failures in three full runs; every fixed file passed 30 consecutive loaded runs.
 - **Sources:** this branch, `coordinator/test/fixtures/virtual-clock.mjs`, `private-artifact-permissions.mjs`, `benchmark/latency-runner.mjs`, about 30 test files
+
+## Speed run: server tick hot spots (Oct 9, 2026)
+
+### Fewer disk syncs and less repeated work on the shared server thread
+- **Problem:** Every action forced 2-3 disk syncs on the shared server thread, sight rays always ran the full block clip, and each tick repeated path checks and secret-file hashing.
+- **Solution:** One journal sync runs before actions run and one right after, air-only sight rays skip the clip, path checks no longer allocate, death bookkeeping is throttled and secret checks are cached. A first version delayed every result by one tick, which review caught and fixed.
+- **Result:** (measured, headless) action round trip equal to base (1 agent p50 ~95 ms); mean tick 2.63 -> 2.48 ms (1 agent) and 5.07 -> 4.58 ms (8 agents moving).
+- **Sources:** this branch, `DurableActionJournal`, `ServerObservationCollector`, `ServerNavigationController`, `MultiplexedServerBridge`

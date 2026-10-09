@@ -1301,12 +1301,15 @@ public final class CoordinatorProcessSupervisorVerification {
 				FileTime timestamp = Files.getLastModifiedTime(secret);
 				Files.writeString(secret, "w".repeat(32));
 				Files.setLastModifiedTime(secret, timestamp);
+				assertEquals(initial, CodexAgentServerRuntime.voiceConfigurationSnapshot(supervisor),
+						"same-size/same-time content is not re-read inside the rehash interval");
+				Thread.sleep(CodexAgentServerRuntime.EXPLICIT_SECRET_REHASH_INTERVAL_MS + 100L);
 				var rotated = CodexAgentServerRuntime.voiceConfigurationSnapshot(supervisor);
-				assertTrue(rotated.prepared() && rotated.revision() != initial.revision(), "same-size/same-time rotation detected next observation");
+				assertTrue(rotated.prepared() && rotated.revision() != initial.revision(), "same-size/same-time rotation detected after the rehash interval");
 				Files.writeString(secret, "short");
 				assertTrue(!CodexAgentServerRuntime.voiceConfigurationSnapshot(supervisor).prepared(), "invalid secret fences voice");
 			}
-		} catch (IOException failure) {
+		} catch (IOException | InterruptedException failure) {
 			throw new AssertionError("manual secret fixture", failure);
 		} finally {
 			restoreProperty("arenaagents.coordinatorAutoStart", oldAutoStart);
@@ -2409,6 +2412,7 @@ public final class CoordinatorProcessSupervisorVerification {
 			Files.writeString(secretFile, rotatedSecret, StandardCharsets.UTF_8);
 			Files.setLastModifiedTime(secretFile, originalTimestamp);
 			CodexAgentServerRuntime.reconcileBridgeConfiguration(slot, uninitializedManager(), supervisor);
+			assertEquals(initialBridge, slot.bridge(), "same-size/same-time content is not re-read inside the rehash interval");
 			long rotationDeadline = System.currentTimeMillis() + 3_000L;
 			while ((slot.bridge() == null || slot.bridge() == initialBridge)
 					&& System.currentTimeMillis() < rotationDeadline) {

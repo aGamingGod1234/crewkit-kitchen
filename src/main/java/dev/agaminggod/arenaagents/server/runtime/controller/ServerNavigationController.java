@@ -873,24 +873,42 @@ public final class ServerNavigationController implements ServerController {
 	}
 
 	static boolean clearWalkLine(WalkabilityView world, Vec3 from, Vec3 to, int level) {
+		return clearWalkLineWithScratch(world, from, to, level, CLEAR_WALK_LINE_SCRATCH.get());
+	}
+
+	static boolean clearWalkLineWithScratch(WalkabilityView world, Vec3 from, Vec3 to, int level, long[] checked) {
 		double dx = to.x - from.x;
 		double dz = to.z - from.z;
 		int samples = Math.max(1, (int) Math.ceil(Math.sqrt(dx * dx + dz * dz) / STEERING_SAMPLE_SPACING));
-		Set<GridPosition> checked = new java.util.HashSet<>();
+		if (checked.length == 0) throw new IllegalArgumentException("clearWalkLine scratch must not be empty");
+		int cursor = 0;
+		int checkedCount = 0;
 		for (int sample = 0; sample <= samples; sample++) {
 			double t = (double) sample / samples;
 			double x = from.x + dx * t;
 			double z = from.z + dz * t;
 			for (int corner = 0; corner < 4; corner++) {
-				GridPosition cell = new GridPosition(
-						(int) Math.floor(x + ((corner & 1) == 0 ? -STEERING_HALF_WIDTH : STEERING_HALF_WIDTH)),
-						level,
-						(int) Math.floor(z + ((corner & 2) == 0 ? -STEERING_HALF_WIDTH : STEERING_HALF_WIDTH)));
-				if (checked.add(cell) && world.traversalAt(cell) != TraversalType.WALK) return false;
+				int cellX = (int) Math.floor(x + ((corner & 1) == 0 ? -STEERING_HALF_WIDTH : STEERING_HALF_WIDTH));
+				int cellZ = (int) Math.floor(z + ((corner & 2) == 0 ? -STEERING_HALF_WIDTH : STEERING_HALF_WIDTH));
+				long key = (long) cellX << 32 | cellZ & 0xffffffffL;
+				boolean seen = false;
+				for (int previous = 0; previous < checkedCount; previous++) {
+					if (checked[previous] == key) {
+						seen = true;
+						break;
+					}
+				}
+				if (seen) continue;
+				checked[cursor] = key;
+				cursor = (cursor + 1) % checked.length;
+				checkedCount = Math.min(checkedCount + 1, checked.length);
+				if (world.traversalAt(new GridPosition(cellX, level, cellZ)) != TraversalType.WALK) return false;
 			}
 		}
 		return true;
 	}
+
+	private static final ThreadLocal<long[]> CLEAR_WALK_LINE_SCRATCH = ThreadLocal.withInitial(() -> new long[8]);
 
 	private TickResult succeed(ServerPlayer player, String reasonCode, String message) {
 		cancel(player);

@@ -129,6 +129,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private static final int SERVER_CONTROL_TASKS_PER_TICK = 16;
 	private static final int SERVER_BULK_TASKS_PER_TICK = 8;
 	private static final int SERVER_INSPECTION_TASKS_PER_TICK = 8;
+	// One second of consecutive failed journal writes, then unrecorded acceptances go back to the model.
+	private static final int JOURNAL_FAILURE_REJECTION_THRESHOLD = 20;
+	private static final long JOURNAL_FAILURE_WARNING_INTERVAL_NANOS = 5_000_000_000L;
 	private static final int OBSERVATION_HISTORY_CAPACITY = 4_096;
 	private static final int MAX_TARGET_IDS_PER_OBSERVATION = 64;
 	private static final int MAX_TARGET_IDS_WITH_INSPECTIONS = 320;
@@ -185,6 +188,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final SecureRandom authenticationRandom = new SecureRandom();
 	private final ProgramActionLedger programActions = new ProgramActionLedger();
 	private final TerminalResultLedger terminalResults = new TerminalResultLedger();
+	private List<ServerActionResult> pendingDurableTerminalResults = new ArrayList<>();
+	private int consecutiveJournalFailures;
+	private long lastJournalFailureWarningNanos;
+	private List<PendingRespawnPublication> pendingRespawnPublications = new ArrayList<>();
 	private final DurableActionJournal actionJournal;
 	private final Object verboseControlLock = new Object();
 	private final Set<AgentId> protocolKnownAgentIds = new HashSet<>();
@@ -437,7 +444,6 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	public void startTick() {
 		admissionTicks++;
 		drainServerTasks();
-		flushActionResultAcknowledgements();
 	}
 
 	/** Publishes terminal results and post-physics observations at the end of the tick. */
@@ -478,7 +484,24 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private void drainServerTasks() {
 		serverTasks.drainBeforePhysics(
 				SERVER_TASKS_PER_TICK - SERVER_CONTROL_TASKS_PER_TICK - SERVER_BULK_TASKS_PER_TICK - SERVER_INSPECTION_TASKS_PER_TICK,
-				SERVER_CONTROL_TASKS_PER_TICK, SERVER_BULK_TASKS_PER_TICK, this::runServerTask, actionExecutor::tick);
+				SERVER_CONTROL_TASKS_PER_TICK, SERVER_BULK_TASKS_PER_TICK,
+				this::runServerTask, this::executeAcceptedInput);
+	}
+
+	/**
+	 * Forces admitted actions before they run, then forces again so a result that finishes in the executor leaves in the
+	 * same tick. While the journal cannot write, only agents whose acceptance is still staged wait; the rest keep running.
+	 */
+	private void executeAcceptedInput() {
+		boolean durable = flushActionJournalGroup();
+		actionExecutor.tick(durable ? Set.of() : agentsWithStagedAcceptances());
+		if (durable) flushActionJournalGroup();
+	}
+
+	private Set<AgentId> agentsWithStagedAcceptances() {
+		Set<AgentId> agents = new HashSet<>();
+		for (ServerActionRequest request : actionJournal.stagedAcceptances()) agents.add(request.agentId());
+		return agents;
 	}
 
 	private void runServerTask(Runnable task) {
@@ -715,7 +738,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	@Override
 	public boolean onCreated(AgentRecord record) {
 		registryPublicationRevision.incrementAndGet();
-		actionJournal.retainGoal(record.agentId(), logicalGoalId(record));
+		actionJournal.retainGoalForTick(record.agentId(), logicalGoalId(record));
 		programActions.beginGoal(record.agentId(), record.goalRevision());
 		terminalResults.beginGoal(record.agentId(), record.goalRevision(), logicalGoalId(record));
 		synchronized (publicationLock) {
@@ -783,7 +806,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			send("goal_control", transition.after().agentId().toString(), goalControlPayload(transition, operation));
 			return null;
 		});
-		actionJournal.retainGoal(transition.after().agentId(), logicalGoalId(transition.after()));
+		actionJournal.retainGoalForTick(transition.after().agentId(), logicalGoalId(transition.after()));
 	}
 
 	void setHandshakeSnapshotHookForVerification(Runnable hook) {
@@ -812,7 +835,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		programActions.remove(agentId);
 		terminalResults.remove(agentId);
 		latestAgentNotices.remove(agentId);
-		actionJournal.remove(agentId);
+		actionJournal.removeForTick(agentId);
 		observationPublication.remove(agentId);
 		activatedGoalSpecRequests.entrySet().removeIf(entry -> entry.getValue().agentId().equals(agentId));
 		synchronized (publicationLock) {
@@ -863,6 +886,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	public synchronized void close() {
 		try {
 			closeTransport();
+			flushActionJournalGroup();
 		} finally {
 			actionJournal.close();
 		}
@@ -894,6 +918,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		try {
 			closeTransport();
 			publishPendingDisconnects();
+			flushActionJournalGroup();
 		} finally {
 			actionJournal.close();
 		}
@@ -1182,15 +1207,66 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 	}
 
-	private void flushActionResultAcknowledgements() {
+	private boolean flushActionJournalGroup() {
+		List<DurableActionJournal.ActionKey> acknowledged;
 		try {
-			for (DurableActionJournal.ActionKey key : actionJournal.flushAcknowledgements()) {
+			acknowledged = actionJournal.flushTickGroup();
+		} catch (AgentDomainException exception) {
+			recordJournalFailure(exception);
+			return false;
+		}
+		consecutiveJournalFailures = 0;
+		try {
+			for (DurableActionJournal.ActionKey key : acknowledged) {
 				terminalResults.acknowledge(key.agentId(), key.goalRevision(), key.actionId());
 			}
+			List<ServerActionResult> durableResults = pendingDurableTerminalResults();
+			while (!durableResults.isEmpty()) {
+				ServerActionResult result = durableResults.get(0);
+				publishCommittedActionResult(result);
+				durableResults.remove(0);
+			}
+			publishDurableRespawnResults();
+			return true;
 		} catch (AgentDomainException exception) {
-			// The journal retains the whole group. Retry next tick without requiring reconnect.
-			LOGGER.debug("Terminal acknowledgement group will retry next tick: {}", exception.getMessage());
+			LOGGER.debug("Committed action publication will retry next tick: {}", exception.getMessage());
+			return false;
 		}
+	}
+
+	/**
+	 * The journal retains the whole group and retries every tick. A persistent outage must not stall silently:
+	 * warn, and after a bounded number of failures hand the not-yet-durable acceptances back to the model.
+	 */
+	private void recordJournalFailure(AgentDomainException exception) {
+		consecutiveJournalFailures++;
+		long now = System.nanoTime();
+		if (consecutiveJournalFailures == 1 || now - lastJournalFailureWarningNanos >= JOURNAL_FAILURE_WARNING_INTERVAL_NANOS) {
+			lastJournalFailureWarningNanos = now;
+			LOGGER.warn("Action journal write failed {} time(s) in a row; accepted actions wait for it: {}",
+					consecutiveJournalFailures, exception.getCause() == null ? exception.getMessage() : exception.getCause());
+		}
+		if (consecutiveJournalFailures >= JOURNAL_FAILURE_REJECTION_THRESHOLD) rejectStagedAcceptances();
+	}
+
+	private void rejectStagedAcceptances() {
+		for (ServerActionRequest request : actionJournal.stagedAcceptances()) {
+			// A respawn already moved the lifecycle and reports through the respawn publication; it keeps retrying.
+			if (request.type() == ActionType.RESPAWN || !actionJournal.rollbackAccepted(request)) continue;
+			programActions.rollback(request);
+			actionExecutor.rejectUnstarted(request, "ACTION_JOURNAL_UNAVAILABLE",
+					"The server could not record the action durably; it did not run. Try it again.");
+		}
+	}
+
+	private List<ServerActionResult> pendingDurableTerminalResults() {
+		if (pendingDurableTerminalResults == null) pendingDurableTerminalResults = new ArrayList<>();
+		return pendingDurableTerminalResults;
+	}
+
+	private List<PendingRespawnPublication> pendingRespawnPublications() {
+		if (pendingRespawnPublications == null) pendingRespawnPublications = new ArrayList<>();
+		return pendingRespawnPublications;
 	}
 
 	private void acceptGoalSpecProposal(BridgeEnvelope envelope) {
@@ -2206,7 +2282,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			if (isDetachedConversationReply(record, request)) {
 				actionExecutor.submitConversationReply(request);
 			} else {
-				actionJournal.accept(request, logicalGoalId(record));
+				actionJournal.acceptForTick(request, logicalGoalId(record));
 				durableAccepted = true;
 				try {
 					programActions.accept(request);
@@ -2305,6 +2381,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	private record RejectionIdentity(String agentId, long goalRevision, String actionId, String actionType, String traceId) { }
 	private record RecoveryObservationIdentity(long coordinatorLifecycleGeneration, long goalRevision) { }
+	private record PendingRespawnPublication(ServerActionResult result, AgentTransition transition, Runnable commit) { }
 
 	static String boundedRejectionMessage(String message) {
 		String fallback = "Action rejected";
@@ -2456,7 +2533,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private void sendActionResult(ServerActionResult result) {
-		actionJournal.terminalIfAccepted(result);
+		if (actionJournal.terminalIfAcceptedForTick(result)) {
+			pendingDurableTerminalResults().add(result);
+			return;
+		}
+		publishCommittedActionResult(result);
+	}
+
+	private void publishCommittedActionResult(ServerActionResult result) {
 		programActions.terminal(result);
 		observations.invalidatePlayerState(result.agentId());
 		ScenarioRuntimeService.onAgentAction(
@@ -2502,7 +2586,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				actionExecutor.actionSuccessLedger().retainRevision(event.agentId(), transition.after().goalRevision());
 				programActions.beginGoal(event.agentId(), transition.after().goalRevision());
 				terminalResults.beginGoal(event.agentId(), transition.after().goalRevision(), logicalGoalId(transition.after()));
-				actionJournal.retainGoal(event.agentId(), logicalGoalId(transition.after()));
+				actionJournal.retainGoalForTick(event.agentId(), logicalGoalId(transition.after()));
 				observationPublication.markAttention(event.agentId());
 				queueUrgentObservation(event.agentId());
 				publishConversationWakeScenarioState(transition);
@@ -2613,10 +2697,28 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private void sendRespawnResultBeforeControl(ServerActionResult result, AgentTransition transition, Runnable commit) {
+		if (!actionJournal.terminalIfAcceptedForTick(result)) {
+			throw new AgentDomainException("ACTION_JOURNAL_MISSING", "Respawn result has no durable acceptance record");
+		}
+		pendingRespawnPublications().add(new PendingRespawnPublication(result, transition, commit));
+	}
+
+	private void publishDurableRespawnResults() {
+		List<PendingRespawnPublication> publications = pendingRespawnPublications();
+		for (int index = 0; index < publications.size();) {
+			PendingRespawnPublication pending = publications.get(index);
+			if (publishRespawnResultBeforeControl(pending)) publications.remove(index);
+			else index++;
+		}
+	}
+
+	private boolean publishRespawnResultBeforeControl(PendingRespawnPublication pending) {
+		ServerActionResult result = pending.result();
+		AgentTransition transition = pending.transition();
 		synchronized (publicationLock) {
 			Session active = session;
 			if (active == null || !active.open.get() || !active.authenticated.get()) {
-				throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Respawn result has no authenticated coordinator");
+				return false;
 			}
 			BridgeEnvelope resultEnvelope = new BridgeEnvelope(2, serverInstanceId, result.agentId().toString(), "action_result",
 					"server-" + messageIds.incrementAndGet(), actionResultPayload(result, active));
@@ -2627,13 +2729,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				if (!terminalResults.claim(result, active)) throw new BridgeProtocolException("ACTION_RESULT_REPLAY_CONFLICT", "Respawn result is already queued");
 				publishRespawnScenarioEvents(
 						() -> active.enqueuePair(resultEnvelope, controlEnvelope,
-								() -> commitRespawnTerminal(commit, () -> actionJournal.terminal(result))),
+								() -> commitRespawnTerminal(pending.commit(), () -> { })),
 						() -> ScenarioRuntimeService.onAgentAction(manager.server(), result.agentId().toString(), result.actionType().wireName(), true),
 						() -> ScenarioRuntimeService.onAgentState(manager.server(), transition.after().agentId().toString(), publicState(transition.after().state()))
 				);
 			} catch (RuntimeException exception) {
 				terminalResults.discard(result, active);
-				throw exception;
+				LOGGER.debug("Respawn result/control pair will retry after durable commit: {}", exception.getMessage());
+				return false;
 			}
 		}
 		programActions.terminal(result);
@@ -2642,6 +2745,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		verboseState.finishAction(result);
 		observationPublication.markAttention(result.agentId());
 		queueUrgentObservation(result.agentId());
+		return true;
 	}
 
 	static void publishRespawnScenarioEvents(Runnable publication, Runnable actionEvent, Runnable stateEvent) {

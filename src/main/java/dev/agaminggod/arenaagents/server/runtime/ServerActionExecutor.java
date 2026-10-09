@@ -337,11 +337,18 @@ public final class ServerActionExecutor {
 	}
 
 	public synchronized void tick() {
+		tick(Set.of());
+	}
+
+	/** Ticks every action except those of the held agents, whose acceptance is not durable yet. */
+	public synchronized void tick(Set<AgentId> held) {
 		long now = System.currentTimeMillis();
 		retryPendingPublications();
 		List<ActiveAction> actions = new ArrayList<>(active.values());
 		try (ServerPathPlanner.TickScope ignored = ServerPathPlanner.beginServerTick()) {
-			for (PendingRespawn pending : new ArrayList<>(pendingRespawns.values())) tickRespawn(pending, now);
+			for (PendingRespawn pending : new ArrayList<>(pendingRespawns.values())) {
+				if (!held.contains(pending.request().agentId())) tickRespawn(pending, now);
+			}
 			for (ActiveAction action : new ArrayList<>(quarantinedActions.values())) {
 				CleanupRetry<ServerActionResult> pending = pendingCompletions.get(action.request().agentId());
 				if (pending != null) finish(action, pending.pending());
@@ -352,6 +359,7 @@ public final class ServerActionExecutor {
 			pathfindingRoundRobinCursor++;
 			for (int offset = 0; offset < actions.size(); offset++) {
 				ActiveAction action = actions.get((start + offset) % actions.size());
+				if (held.contains(action.request().agentId())) continue;
 				if (pendingPublications.containsKey(action.request().agentId())) continue;
 				CleanupRetry<ServerActionResult> pending = pendingCompletions.get(action.request().agentId());
 				if (pending != null) {
@@ -508,6 +516,14 @@ public final class ServerActionExecutor {
 		} catch (RuntimeException ignored) {
 			// Progress is advisory telemetry; bridge backpressure must never abort the server tick.
 		}
+	}
+
+	/** Fails an action that was admitted but has not ticked yet, so the model can retry it. */
+	public synchronized boolean rejectUnstarted(ServerActionRequest request, String reasonCode, String message) {
+		ActiveAction action = active.get(request.agentId());
+		if (action == null || !action.request().equals(request)) return false;
+		finish(action, action.result(ServerActionState.FAILED, reasonCode, message, System.currentTimeMillis()));
+		return true;
 	}
 
 	public synchronized boolean cancel(AgentId agentId, String reason) {

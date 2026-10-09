@@ -143,6 +143,8 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 			Files.setLastModifiedTime(manualSecret, originalTimestamp);
 			assertEquals(512L, Files.size(manualSecret),
 					"tail-only rotation preserves the maximum accepted secret file size");
+			// Metadata is unchanged, so detection waits for the bounded content re-read.
+			Thread.sleep(CodexAgentServerRuntime.EXPLICIT_SECRET_REHASH_INTERVAL_MS + 100L);
 			long rotatedManualRevision = CodexAgentServerRuntime.voiceConfigurationRevision(manual);
 			assertFalse(initialManualRevision == rotatedManualRevision,
 					"same-size same-timestamp tail rotation advances the voice gate revision");
