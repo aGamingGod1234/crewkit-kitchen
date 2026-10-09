@@ -155,6 +155,7 @@ public final class GuestChatterFeature implements CrewkitFeature {
 		});
 		while (bubbles.size() >= MAX_BUBBLES) pop(bubbles.pollFirst());
 		spawnBubble(server, guest, line, particle, BUBBLE_TICKS, 1.1f + random.nextFloat() * 0.5f);
+		dev.agaminggod.arenaagents.crewkit.director.DirectorFeature.guestSpoke(guest.position());
 	}
 
 	private void spawnBubble(MinecraftServer server, Entity guest, String line, String particle, int life, float pitch) {

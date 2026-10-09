@@ -29,7 +29,8 @@ import org.lwjgl.glfw.GLFW;
 
 /**
  * CrewKit film camera. While live (/ckcam on or the step keys), the view rides a client-side marker
- * that glides between CrewkitMarks with ease-in-out, and the HUD is hidden for recording.
+ * that glides between CrewkitMarks with ease-in-out (routing around props via mid-room waypoints), then
+ * drifts in slowly while the shot holds. The HUD is hidden for recording.
  * Server DirectorFeature sends a mark per contract event; ] and [ step marks by hand; \ releases.
  */
 public final class CrewkitCameraClient {
@@ -50,10 +51,13 @@ public final class CrewkitCameraClient {
 	private static CameraType previousCameraType;
 	private static Boolean previousHideGui;
 
-	/** Current pose and glide state: from -> to over [start, start + duration] client ticks. */
-	private static double[] from, to, pose;
+	/** Current pose and glide state: from -> to over [start, start + duration] client ticks, then to -> rest over the hold. */
+	private static double[] from, to, rest, pose;
+	/** Glide positions: from, any waypoints, to. Cumulative lengths for constant-speed travel along them. */
+	private static double[][] path;
+	private static double[] pathLength;
 	private static long ticks, moveStart;
-	private static int moveDuration;
+	private static int moveDuration, holdDuration;
 
 	public static void register() {
 		CrewkitCameraPayload.register();
@@ -68,24 +72,30 @@ public final class CrewkitCameraClient {
 
 	private static void accept(CrewkitCameraPayload payload) {
 		originX = payload.originX(); originY = payload.originY(); originZ = payload.originZ();
-		if (live) go(Minecraft.getInstance(), payload.mark(), payload.moveTicks());
+		if (live) go(Minecraft.getInstance(), payload.mark(), payload.moveTicks(), payload.holdTicks());
 		else markId = payload.mark(); // stepping resumes from the director's latest beat
 	}
 
-	private static double[] poseFor(CrewkitMarks.Mark mark) {
+	private static int[] origin() {
 		if (originX == Integer.MIN_VALUE) {
 			// Singleplayer shares CrewkitAnchors with the integrated server; good until the first payload arrives.
 			var o = CrewkitAnchors.origin;
-			return mark.pose(o.getX(), o.getY(), o.getZ());
+			return new int[] {o.getX(), o.getY(), o.getZ()};
 		}
-		return mark.pose(originX, originY, originZ);
+		return new int[] {originX, originY, originZ};
 	}
 
 	private static boolean go(Minecraft client, String id, int moveTicks) {
+		return go(client, id, moveTicks, 100);
+	}
+
+	private static boolean go(Minecraft client, String id, int moveTicks, int holdTicks) {
 		var mark = CrewkitMarks.byId(id);
 		if (mark.isEmpty() || client.level == null || client.player == null) return false;
 		if (PovClient.session().isPresent()) return false;
-		double[] target = poseFor(mark.get());
+		int[] o = origin();
+		double[] target = mark.get().startPose(o[0], o[1], o[2]);
+		double[] end = mark.get().pose(o[0], o[1], o[2]);
 		markId = mark.get().id();
 		if (!live || pose == null) {
 			live = true;
@@ -96,11 +106,42 @@ public final class CrewkitCameraClient {
 			// Shortest turn: keep yaw continuous so the marker's interpolation never spins the long way.
 			target[3] = from[3] + wrap(target[3] - from[3]);
 		}
+		end[3] = target[3] + wrap(end[3] - target[3]);
 		to = target;
+		rest = end;
+		// Route around the pass, chef stack and tables when the straight line would clip them.
+		double[] a = {from[0] - o[0], from[1] - o[1], from[2] - o[2]}, b = {to[0] - o[0], to[1] - o[1], to[2] - o[2]};
+		var via = CrewkitMarks.route(a, b);
+		int n = via == null ? 0 : via.size();
+		path = new double[n + 2][];
+		path[0] = new double[] {from[0], from[1], from[2]};
+		for (int i = 0; i < n; i++) path[i + 1] = new double[] {via.get(i)[0] + o[0], via.get(i)[1] + o[1], via.get(i)[2] + o[2]};
+		path[n + 1] = new double[] {to[0], to[1], to[2]};
+		pathLength = new double[path.length];
+		for (int i = 1; i < path.length; i++) pathLength[i] = pathLength[i - 1] + dist(path[i - 1], path[i]);
 		moveStart = ticks;
-		moveDuration = Math.max(1, moveTicks);
+		// Detours are longer, so give them a little more time.
+		moveDuration = Math.max(1, n == 0 ? moveTicks : Math.min(48, moveTicks + 8 * n));
+		holdDuration = Math.max(1, holdTicks);
 		apply(client);
 		return true;
+	}
+
+	private static double dist(double[] p, double[] q) {
+		double dx = p[0] - q[0], dy = p[1] - q[1], dz = p[2] - q[2];
+		return Math.sqrt(dx * dx + dy * dy + dz * dz);
+	}
+
+	/** Position at eased fraction e of the glide path. */
+	private static void along(double e) {
+		double total = pathLength[pathLength.length - 1];
+		if (total < 1e-6) { System.arraycopy(path[path.length - 1], 0, pose, 0, 3); return; }
+		double d = e * total;
+		int i = 1;
+		while (i < path.length - 1 && pathLength[i] < d) i++;
+		double seg = pathLength[i] - pathLength[i - 1];
+		double u = seg < 1e-6 ? 1 : (d - pathLength[i - 1]) / seg;
+		for (int k = 0; k < 3; k++) pose[k] = path[i - 1][k] + (path[i][k] - path[i - 1][k]) * u;
 	}
 
 	private static void step(Minecraft client, int delta) {
@@ -117,9 +158,18 @@ public final class CrewkitCameraClient {
 		while (RELEASE.consumeClick()) if (client.screen == null) release(client);
 		if (!live) return;
 		if (client.level == null || client.player == null || PovClient.session().isPresent()) { release(client); return; }
-		double t = Math.min(1.0, (ticks - moveStart) / (double) moveDuration);
-		double e = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; // ease-in-out cubic
-		for (int i = 0; i < 5; i++) pose[i] = from[i] + (to[i] - from[i]) * e;
+		long elapsed = ticks - moveStart;
+		if (elapsed < moveDuration) {
+			double t = elapsed / (double) moveDuration;
+			double e = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; // ease-in-out cubic
+			along(e);
+			for (int i = 3; i < 5; i++) pose[i] = from[i] + (to[i] - from[i]) * e;
+		} else {
+			// Hold: a slow smoothstep dolly from the landing pose to the fitted pose (DRIFT blocks) keeps the shot alive.
+			double t = Math.min(1.0, (elapsed - moveDuration) / (double) holdDuration);
+			double e = t * t * (3 - 2 * t);
+			for (int i = 0; i < 5; i++) pose[i] = to[i] + (rest[i] - to[i]) * e;
+		}
 		apply(client);
 	}
 
@@ -157,7 +207,7 @@ public final class CrewkitCameraClient {
 
 	public static void release(Minecraft client) {
 		boolean wasLive = live;
-		live = false; pose = null; from = null; to = null;
+		live = false; pose = null; from = null; to = null; rest = null; path = null;
 		if (anchor != null) { anchor.remove(Entity.RemovalReason.DISCARDED); anchor = null; }
 		if (!wasLive && previousCamera == null && previousHideGui == null) return;
 		Entity restore = previousCamera;
