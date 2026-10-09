@@ -5,6 +5,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.crewkit.CrewkitAnchors;
 import dev.agaminggod.arenaagents.crewkit.CrewkitFeature;
+import dev.agaminggod.arenaagents.crewkit.set.SetBuilder;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -64,7 +65,8 @@ public final class FlowFeature implements CrewkitFeature {
 	private static final double BAR_UP_Y = 7.2;
 	private static final double BAR_HEIGHT = 3.0;
 	private static final double HOURGLASS_X = 12.3;
-	private static final double PLATE_Y = 2.0;
+	/** Plates and trays sit on the cloth (carpet on a top slab), not inside it. */
+	private static final double PLATE_Y = SetBuilder.TABLE_TOP_Y;
 	private static final double[] BAG = {25.5, 1.0, 6.5};
 
 	private static final int PAPER = argb(0xFFF3E9CF);
@@ -502,7 +504,7 @@ public final class FlowFeature implements CrewkitFeature {
 			if (wave.perPlate()) {
 				for (int s : wave.seats()) targets.add(plateSlot(s, perSeatCount[s]++));
 			} else if (wave.seats().isEmpty()) {
-				targets.add(rel(12.0, PLATE_Y, 13.0));
+				targets.add(rel(14.0, PLATE_Y, 13.0)); // centre of table B (blocks x 12..15, z 12..13)
 			} else {
 				targets.add(trayPos(server, wave.seats(), at));
 			}
