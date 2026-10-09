@@ -48,6 +48,7 @@ public final class ItemsFeature implements CrewkitFeature {
 	static final int HOVER_GRACE = 6;
 	static final double HOVER_REACH = 48;
 
+	private static final org.slf4j.Logger LOGGER = org.slf4j.LoggerFactory.getLogger("crewkit-items");
 	private static volatile ItemsFeature instance;
 	private static List<StackedItem> handoff = List.of();
 
@@ -120,6 +121,15 @@ public final class ItemsFeature implements CrewkitFeature {
 
 	@Override
 	public void tick(MinecraftServer server) {
+		try {
+			tickInner(server);
+		} catch (RuntimeException e) {
+			// a visual glitch must never take the demo server down
+			LOGGER.error("CrewKit items tick failed", e);
+		}
+	}
+
+	private void tickInner(MinecraftServer server) {
 		this.server = server;
 		int serverTick = server.getTickCount();
 		if (serverTick == lastServerTick) return; // dispatcher and dev harness may both tick us
@@ -131,14 +141,16 @@ public final class ItemsFeature implements CrewkitFeature {
 			Fx.cmd(server, "kill @e[tag=" + Fx.TAG + "]"); // leftovers saved with the world from an earlier session
 		}
 
+		// collect first: a task may schedule more tasks
+		List<Scheduled> due = new ArrayList<>();
 		for (Iterator<Scheduled> it = scheduled.iterator(); it.hasNext(); ) {
 			Scheduled s = it.next();
 			if (s.at <= now) {
 				it.remove();
-				s.task.run();
+				due.add(s);
 			}
 		}
-		// tasks may schedule more tasks; they run next tick
+		for (Scheduled s : due) s.task.run();
 
 		if (now >= busyUntil && !queue.isEmpty()) {
 			int busy = queue.poll().getAsInt();
@@ -270,7 +282,8 @@ public final class ItemsFeature implements CrewkitFeature {
 		if (hovered == s) hovered = null;
 		s.discardExtras(level);
 		Fx.sound(level, s.pos, SoundEvents.ITEM_PICKUP, 0.7f, 0.6f);
-		fallers.add(new Faller(s.display, s.pos, index % 2 == 0 ? 1 : -1));
+		double floorY = headTop().y - 1.92 + 0.12; // chef's feet, item rests just above the floor
+		fallers.add(new Faller(s.display, s.pos, index % 2 == 0 ? 1 : -1, floorY));
 		return TUMBLE_TICKS - 4;
 	}
 
@@ -576,11 +589,13 @@ public final class ItemsFeature implements CrewkitFeature {
 
 	private final class Faller {
 		final UUID display;
+		final double floorY;
 		Vec3 pos, vel;
 		int t;
 
-		Faller(UUID display, Vec3 start, int side) {
+		Faller(UUID display, Vec3 start, int side, double floorY) {
 			this.display = display;
+			this.floorY = floorY;
 			this.pos = start;
 			this.vel = new Vec3(0.09 * side, 0.2, 0.05);
 			Quaternionf spin = new Quaternionf().rotateZ((float) (-side * Math.toRadians(150))).rotateX(0.5f);
@@ -592,6 +607,10 @@ public final class ItemsFeature implements CrewkitFeature {
 			t++;
 			vel = new Vec3(vel.x * 0.97, vel.y - 0.04, vel.z * 0.97);
 			pos = pos.add(vel);
+			if (pos.y < floorY) { // small bounce instead of sinking into the floor
+				pos = new Vec3(pos.x, floorY, pos.z);
+				vel = new Vec3(vel.x * 0.6, -vel.y * 0.3, vel.z * 0.6);
+			}
 			Fx.move(level, display, pos);
 			if (t >= TUMBLE_TICKS + 1) {
 				Fx.discard(level, display);
