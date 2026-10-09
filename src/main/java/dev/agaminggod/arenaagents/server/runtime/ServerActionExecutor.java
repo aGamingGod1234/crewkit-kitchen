@@ -621,7 +621,27 @@ public final class ServerActionExecutor {
 		return action == null ? null : action.request();
 	}
 
+	/**
+	 * While a CrewKit kitchen exists, the agent named Chef is a stage actor: the kitchen moves it, and it only
+	 * talks and calls crewkit_shop. Reject actions that would move it or change the set (it tried to mine on camera).
+	 */
+	private static void rejectCrewkitChefWorldAction(ServerActionRequest request, ServerPlayer player) {
+		if (player == null || !dev.agaminggod.arenaagents.crewkit.cast.ChefReady.NAME.equals(player.getName().getString())) return;
+		switch (request.type()) {
+			case BREAK_BLOCK, PLACE_BLOCK, BUILD_SEQUENCE, ATTACK, FIGHT_TARGET, USE_ITEM, USE_RANGED, INTERACT_BLOCK,
+					INTERACT_ENTITY, MOVE_TO, NAVIGATE_TO, FOLLOW_ENTITY, FLEE_FROM, CONTROL, CONTROL_SEQUENCE, DROP_ITEM,
+					SET_DOOR, START_FALL_FLYING, SET_FLIGHT -> {
+				if (dev.agaminggod.arenaagents.crewkit.set.SetBuilder.isBuilt(player.level().getServer())) {
+					throw new AgentDomainException("CREWKIT_CHEF_STAYS",
+							"The CrewKit chef stays at the pass: only talk and call crewkit_shop");
+				}
+			}
+			default -> { }
+		}
+	}
+
 	private ActiveAction createAction(ServerActionRequest request, ServerPlayer player) {
+		rejectCrewkitChefWorldAction(request, player);
 		JsonObject arguments = request.arguments();
 		return switch (request.type()) {
 			case CONTROL -> ActiveAction.control(
