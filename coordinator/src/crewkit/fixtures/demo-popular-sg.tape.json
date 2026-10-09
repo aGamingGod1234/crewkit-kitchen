@@ -1,0 +1,579 @@
+{
+  "version": 1,
+  "recordedAt": "2026-10-09T08:20:00.000Z",
+  "enrollmentId": "33333333-3333-4333-8333-000000000001",
+  "note": "HAND-WRITTEN fixture, not a real Reap recording. popular.com.sg-style SGD stationery + drinks. First quote 194.90 vs budget 150 (~30% over); sharing cables per pair brings it to 147.50.",
+  "entries": [
+    {
+      "op": "search",
+      "key": "name badge lanyard",
+      "ms": 1150,
+      "response": {
+        "id": "search_1",
+        "products": [
+          {
+            "id": "pop_badge_01",
+            "merchant": {
+              "name": "popular.com.sg"
+            },
+            "name": "Deli Name Badge Holder with Lanyard (Vertical)",
+            "imageUrl": null,
+            "priceRange": {
+              "min": {
+                "amount": 1.5,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 1.5,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_badge_01",
+              "name": "Default",
+              "price": {
+                "amount": 1.5,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          }
+        ],
+        "pagination": {
+          "nextCursor": null,
+          "hasNextPage": false,
+          "returnedCount": 1
+        },
+        "warnings": []
+      }
+    },
+    {
+      "op": "search",
+      "key": "a5 notebook",
+      "ms": 980,
+      "response": {
+        "id": "search_2",
+        "products": [
+          {
+            "id": "pop_nb_01",
+            "merchant": {
+              "name": "popular.com.sg"
+            },
+            "name": "Campap A5 Ruled Notebook 80 Sheets",
+            "imageUrl": null,
+            "priceRange": {
+              "min": {
+                "amount": 2.2,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 2.2,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_nb_01",
+              "name": "Default",
+              "price": {
+                "amount": 2.2,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          }
+        ],
+        "pagination": {
+          "nextCursor": null,
+          "hasNextPage": false,
+          "returnedCount": 1
+        },
+        "warnings": []
+      }
+    },
+    {
+      "op": "search",
+      "key": "gel pen",
+      "ms": 1240,
+      "response": {
+        "id": "search_3",
+        "products": [
+          {
+            "id": "pop_pen_01",
+            "merchant": {
+              "name": "popular.com.sg"
+            },
+            "name": "Pilot G-2 Gel Pen 0.7mm Black",
+            "imageUrl": null,
+            "priceRange": {
+              "min": {
+                "amount": 1.2,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 1.2,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_pen_01",
+              "name": "Default",
+              "price": {
+                "amount": 1.2,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          }
+        ],
+        "pagination": {
+          "nextCursor": null,
+          "hasNextPage": false,
+          "returnedCount": 1
+        },
+        "warnings": []
+      }
+    },
+    {
+      "op": "search",
+      "key": "green tea drink",
+      "ms": 1060,
+      "response": {
+        "id": "search_4",
+        "products": [
+          {
+            "id": "pop_tea_01",
+            "merchant": {
+              "name": "popular.com.sg"
+            },
+            "name": "Pokka Jasmine Green Tea 500ml",
+            "imageUrl": null,
+            "priceRange": {
+              "min": {
+                "amount": 1.45,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 1.45,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_tea_01",
+              "name": "Default",
+              "price": {
+                "amount": 1.45,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          }
+        ],
+        "pagination": {
+          "nextCursor": null,
+          "hasNextPage": false,
+          "returnedCount": 1
+        },
+        "warnings": []
+      }
+    },
+    {
+      "op": "search",
+      "key": "usb-c charging cable",
+      "ms": 1320,
+      "response": {
+        "id": "search_5",
+        "products": [
+          {
+            "id": "pop_cable_01",
+            "merchant": {
+              "name": "popular.com.sg"
+            },
+            "name": "Type-C to Type-C Fast Charging Cable 1m",
+            "imageUrl": null,
+            "priceRange": {
+              "min": {
+                "amount": 7.9,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 7.9,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_cable_01",
+              "name": "Default",
+              "price": {
+                "amount": 7.9,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          }
+        ],
+        "pagination": {
+          "nextCursor": null,
+          "hasNextPage": false,
+          "returnedCount": 1
+        },
+        "warnings": []
+      }
+    },
+    {
+      "op": "search",
+      "key": "bluetooth speaker",
+      "ms": 1010,
+      "response": {
+        "id": "search_6",
+        "products": [
+          {
+            "id": "pop_spk_01",
+            "merchant": {
+              "name": "popular.com.sg"
+            },
+            "name": "Mini Portable Bluetooth Speaker",
+            "imageUrl": null,
+            "priceRange": {
+              "min": {
+                "amount": 19.9,
+                "currency": "SGD"
+              },
+              "max": {
+                "amount": 19.9,
+                "currency": "SGD"
+              }
+            },
+            "available": true,
+            "previewVariant": {
+              "id": "var_spk_01",
+              "name": "Default",
+              "price": {
+                "amount": 19.9,
+                "currency": "SGD"
+              },
+              "available": true
+            }
+          }
+        ],
+        "pagination": {
+          "nextCursor": null,
+          "hasNextPage": false,
+          "returnedCount": 1
+        },
+        "warnings": []
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1850,
+      "response": {
+        "id": "11111111-1111-4111-8111-000000000001",
+        "expiresAt": "2026-10-09T08:30:00.000Z",
+        "shippingOptions": [
+          {
+            "id": "ship_std",
+            "name": "Standard Delivery (2-4 working days)",
+            "selected": true,
+            "price": {
+              "amount": 4,
+              "currency": "SGD"
+            },
+            "details": []
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 190.9,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            },
+            "includedInPrices": true
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 194.9,
+            "currency": "SGD"
+          }
+        }
+      }
+    },
+    {
+      "op": "createQuote",
+      "key": "",
+      "ms": 1700,
+      "response": {
+        "id": "11111111-1111-4111-8111-000000000002",
+        "expiresAt": "2026-10-09T08:30:00.000Z",
+        "shippingOptions": [
+          {
+            "id": "ship_std",
+            "name": "Standard Delivery (2-4 working days)",
+            "selected": true,
+            "price": {
+              "amount": 4,
+              "currency": "SGD"
+            },
+            "details": []
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 143.5,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            },
+            "includedInPrices": true
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 147.5,
+            "currency": "SGD"
+          }
+        }
+      }
+    },
+    {
+      "op": "getQuote",
+      "key": "",
+      "ms": 420,
+      "response": {
+        "id": "11111111-1111-4111-8111-000000000002",
+        "expiresAt": "2026-10-09T08:30:00.000Z",
+        "shippingOptions": [
+          {
+            "id": "ship_std",
+            "name": "Standard Delivery (2-4 working days)",
+            "selected": true,
+            "price": {
+              "amount": 4,
+              "currency": "SGD"
+            },
+            "details": []
+          }
+        ],
+        "amountBreakdown": {
+          "itemsSubtotal": {
+            "amount": 143.5,
+            "currency": "SGD"
+          },
+          "shipping": {
+            "amount": 4,
+            "currency": "SGD"
+          },
+          "tax": {
+            "amount": {
+              "amount": 0,
+              "currency": "SGD"
+            },
+            "includedInPrices": true
+          },
+          "discounts": [],
+          "additionalCharges": [],
+          "finalAmount": {
+            "amount": 147.5,
+            "currency": "SGD"
+          }
+        }
+      }
+    },
+    {
+      "op": "createCheckout",
+      "key": "",
+      "ms": 1300,
+      "response": {
+        "id": "22222222-2222-4222-8222-000000000001",
+        "status": "REQUIRES_ACTION",
+        "quoteId": "11111111-1111-4111-8111-000000000002",
+        "enrollmentId": "33333333-3333-4333-8333-000000000001",
+        "amount": {
+          "amount": 147.5,
+          "currency": "SGD"
+        },
+        "nextAction": {
+          "type": "REDIRECT",
+          "url": "https://sandbox.reap.global/agentic/approve/demo-fixture",
+          "expiresAt": "2026-10-09T08:40:00.000Z"
+        }
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 300,
+      "response": {
+        "id": "22222222-2222-4222-8222-000000000001",
+        "status": "REQUIRES_ACTION",
+        "quoteId": "11111111-1111-4111-8111-000000000002",
+        "enrollmentId": "33333333-3333-4333-8333-000000000001",
+        "orderId": null,
+        "finalAmount": null,
+        "nextAction": {
+          "type": "REDIRECT",
+          "url": "https://sandbox.reap.global/agentic/approve/demo-fixture",
+          "expiresAt": "2026-10-09T08:40:00.000Z"
+        },
+        "createdAt": "2026-10-09T08:20:00.000Z",
+        "updatedAt": "2026-10-09T08:20:00.000Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 300,
+      "response": {
+        "id": "22222222-2222-4222-8222-000000000001",
+        "status": "REQUIRES_ACTION",
+        "quoteId": "11111111-1111-4111-8111-000000000002",
+        "enrollmentId": "33333333-3333-4333-8333-000000000001",
+        "orderId": null,
+        "finalAmount": null,
+        "nextAction": {
+          "type": "REDIRECT",
+          "url": "https://sandbox.reap.global/agentic/approve/demo-fixture",
+          "expiresAt": "2026-10-09T08:40:00.000Z"
+        },
+        "createdAt": "2026-10-09T08:20:00.000Z",
+        "updatedAt": "2026-10-09T08:20:00.000Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 300,
+      "response": {
+        "id": "22222222-2222-4222-8222-000000000001",
+        "status": "REQUIRES_ACTION",
+        "quoteId": "11111111-1111-4111-8111-000000000002",
+        "enrollmentId": "33333333-3333-4333-8333-000000000001",
+        "orderId": null,
+        "finalAmount": null,
+        "nextAction": {
+          "type": "REDIRECT",
+          "url": "https://sandbox.reap.global/agentic/approve/demo-fixture",
+          "expiresAt": "2026-10-09T08:40:00.000Z"
+        },
+        "createdAt": "2026-10-09T08:20:00.000Z",
+        "updatedAt": "2026-10-09T08:20:00.000Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 300,
+      "response": {
+        "id": "22222222-2222-4222-8222-000000000001",
+        "status": "REQUIRES_ACTION",
+        "quoteId": "11111111-1111-4111-8111-000000000002",
+        "enrollmentId": "33333333-3333-4333-8333-000000000001",
+        "orderId": null,
+        "finalAmount": null,
+        "nextAction": {
+          "type": "REDIRECT",
+          "url": "https://sandbox.reap.global/agentic/approve/demo-fixture",
+          "expiresAt": "2026-10-09T08:40:00.000Z"
+        },
+        "createdAt": "2026-10-09T08:20:00.000Z",
+        "updatedAt": "2026-10-09T08:20:00.000Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 300,
+      "response": {
+        "id": "22222222-2222-4222-8222-000000000001",
+        "status": "REQUIRES_ACTION",
+        "quoteId": "11111111-1111-4111-8111-000000000002",
+        "enrollmentId": "33333333-3333-4333-8333-000000000001",
+        "orderId": null,
+        "finalAmount": null,
+        "nextAction": {
+          "type": "REDIRECT",
+          "url": "https://sandbox.reap.global/agentic/approve/demo-fixture",
+          "expiresAt": "2026-10-09T08:40:00.000Z"
+        },
+        "createdAt": "2026-10-09T08:20:00.000Z",
+        "updatedAt": "2026-10-09T08:20:00.000Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 300,
+      "response": {
+        "id": "22222222-2222-4222-8222-000000000001",
+        "status": "REQUIRES_ACTION",
+        "quoteId": "11111111-1111-4111-8111-000000000002",
+        "enrollmentId": "33333333-3333-4333-8333-000000000001",
+        "orderId": null,
+        "finalAmount": null,
+        "nextAction": {
+          "type": "REDIRECT",
+          "url": "https://sandbox.reap.global/agentic/approve/demo-fixture",
+          "expiresAt": "2026-10-09T08:40:00.000Z"
+        },
+        "createdAt": "2026-10-09T08:20:00.000Z",
+        "updatedAt": "2026-10-09T08:20:00.000Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 300,
+      "response": {
+        "id": "22222222-2222-4222-8222-000000000001",
+        "status": "PROCESSING",
+        "quoteId": "11111111-1111-4111-8111-000000000002",
+        "enrollmentId": "33333333-3333-4333-8333-000000000001",
+        "orderId": null,
+        "finalAmount": null,
+        "nextAction": null,
+        "createdAt": "2026-10-09T08:20:00.000Z",
+        "updatedAt": "2026-10-09T08:20:00.000Z"
+      }
+    },
+    {
+      "op": "getCheckout",
+      "key": "",
+      "ms": 300,
+      "response": {
+        "id": "22222222-2222-4222-8222-000000000001",
+        "status": "COMPLETED",
+        "quoteId": "11111111-1111-4111-8111-000000000002",
+        "enrollmentId": "33333333-3333-4333-8333-000000000001",
+        "orderId": "POP-SG-1048213",
+        "finalAmount": {
+          "amount": 147.5,
+          "currency": "SGD"
+        },
+        "nextAction": null,
+        "createdAt": "2026-10-09T08:20:00.000Z",
+        "updatedAt": "2026-10-09T08:20:00.000Z"
+      }
+    }
+  ]
+}
