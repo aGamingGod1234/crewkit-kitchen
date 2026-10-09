@@ -98,14 +98,15 @@ final class NodeVoiceWorkerIntegrationVerification {
 			CompletableFuture<Throwable> outcome = new CompletableFuture<>();
 			Thread verifier = Thread.ofVirtual().start(() -> {
 				try {
-					verify(child, Duration.ofSeconds(1));
+					// Only "silent" must time out; the others need room for a cold child JVM under a parallel build.
+					verify(child, Duration.ofSeconds(mode.equals("silent") ? 1 : 10));
 					outcome.complete(null);
 				} catch (Throwable failure) {
 					outcome.complete(failure);
 				}
 			});
 			try {
-				Throwable failure = outcome.get(5, TimeUnit.SECONDS);
+				Throwable failure = outcome.get(15, TimeUnit.SECONDS);
 				assertEquals(true, mode.equals("silent") ? failure instanceof TimeoutException
 						: failure instanceof AssertionError, mode + " preserves readiness failure");
 				assertEquals(false, child.isAlive(), mode + " terminates its owned fixture");
