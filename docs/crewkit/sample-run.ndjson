@@ -1,0 +1,20 @@
+{"t":0,"seq":1,"event":"reset","data":{}}
+{"t":500,"seq":2,"event":"brief","data":{"title":"Order ticket #001 - Hackathon workshop kit","guests":[{"name":"James","skin":"james"},{"name":"John","skin":"john"},{"name":"Sandy","skin":"sandy"},{"name":"Guest4","skin":"default"},{"name":"Guest5","skin":"default"},{"name":"Guest6","skin":"default"},{"name":"Guest7","skin":"default"},{"name":"Guest8","skin":"default"},{"name":"Guest9","skin":"default"},{"name":"Guest10","skin":"default"},{"name":"Guest11","skin":"default"},{"name":"Guest12","skin":"default"}],"budget":{"amount":150,"currency":"SGD"},"needs":["name badge","notebook","pen","a drink","phone charging cable (one per pair)","speaker (one for the room)"]}}
+{"t":4000,"seq":3,"event":"item_added","data":{"id":"badge","realName":"Popular Name Badge Holder with Lanyard","merchant":"popular.com.sg","mcItem":"minecraft:name_tag","unitPrice":{"amount":1.2,"currency":"SGD"},"qty":12,"seats":["James","John","Sandy","Guest4","Guest5","Guest6","Guest7","Guest8","Guest9","Guest10","Guest11","Guest12"]}}
+{"t":7500,"seq":4,"event":"item_added","data":{"id":"notebook","realName":"Popular A5 Ruled Notebook 80 pages","merchant":"popular.com.sg","mcItem":"minecraft:writable_book","unitPrice":{"amount":3.5,"currency":"SGD"},"qty":12,"seats":["James","John","Sandy","Guest4","Guest5","Guest6","Guest7","Guest8","Guest9","Guest10","Guest11","Guest12"]}}
+{"t":11000,"seq":5,"event":"item_added","data":{"id":"pen","realName":"Pilot G-2 Gel Pen 0.5 Black","merchant":"popular.com.sg","mcItem":"minecraft:feather","unitPrice":{"amount":0.9,"currency":"SGD"},"qty":12,"seats":["James","John","Sandy","Guest4","Guest5","Guest6","Guest7","Guest8","Guest9","Guest10","Guest11","Guest12"]}}
+{"t":14500,"seq":6,"event":"item_added","data":{"id":"drink","realName":"Pokka Green Tea 500ml","merchant":"popular.com.sg","mcItem":"minecraft:potion","unitPrice":{"amount":1.6,"currency":"SGD"},"qty":12,"seats":["James","John","Sandy","Guest4","Guest5","Guest6","Guest7","Guest8","Guest9","Guest10","Guest11","Guest12"]}}
+{"t":18000,"seq":7,"event":"item_added","data":{"id":"cable","realName":"UGREEN USB-C to USB-C Cable 1m","merchant":"popular.com.sg","mcItem":"minecraft:lead","unitPrice":{"amount":5.9,"currency":"SGD"},"qty":12,"seats":["James","John","Sandy","Guest4","Guest5","Guest6","Guest7","Guest8","Guest9","Guest10","Guest11","Guest12"]}}
+{"t":21500,"seq":8,"event":"item_added","data":{"id":"speaker","realName":"Anker Soundcore Mini Speaker","merchant":"popular.com.sg","mcItem":"minecraft:note_block","unitPrice":{"amount":19.9,"currency":"SGD"},"qty":1,"seats":[]}}
+{"t":24000,"seq":9,"event":"calls","data":{"count":7}}
+{"t":25500,"seq":10,"event":"quote","data":{"total":{"amount":185.1,"currency":"SGD"},"budgetRemaining":{"amount":-35.1,"currency":"SGD"},"shipping":{"amount":8,"currency":"SGD"},"quoteId":"qt_sbx_001"}}
+{"t":28000,"seq":11,"event":"gate_blocked","data":{"over":{"amount":35.1,"currency":"SGD"},"reason":"Quote S$185.10 is over the S$150.00 budget"}}
+{"t":33000,"seq":12,"event":"item_removed","data":{"id":"cable","qtyRemoved":6}}
+{"t":35500,"seq":13,"event":"calls","data":{"count":9}}
+{"t":37000,"seq":14,"event":"quote","data":{"total":{"amount":149.7,"currency":"SGD"},"budgetRemaining":{"amount":0.3,"currency":"SGD"},"shipping":{"amount":8,"currency":"SGD"},"quoteId":"qt_sbx_002"}}
+{"t":39500,"seq":15,"event":"gate_passed","data":{"total":{"amount":149.7,"currency":"SGD"}}}
+{"t":42500,"seq":16,"event":"checkout","data":{"approvalUrl":"https://sandbox.reap.example/approve/chk_sbx_42","status":"PENDING_APPROVAL","checkoutId":"chk_sbx_42"}}
+{"t":43500,"seq":17,"event":"calls","data":{"count":10}}
+{"t":57500,"seq":18,"event":"calls","data":{"count":12}}
+{"t":58500,"seq":19,"event":"completed","data":{"orderId":"ord_sbx_7Q2K9","finalAmount":{"amount":149.7,"currency":"SGD"}}}
+{"t":64500,"seq":20,"event":"record","data":{"budget":150,"quoted":149.7,"charged":149.7,"variance":0.3,"orderId":"ord_sbx_7Q2K9","currency":"SGD"}}

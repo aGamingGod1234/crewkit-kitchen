@@ -247,10 +247,8 @@ public final class BoardsFeature implements CrewkitFeature {
 	private int colorFor(double value) {
 		if (value < -0.004) return CrewkitText.RED;
 		if (budget <= 0) return CrewkitText.GREEN;
-		double ratio = value / budget;
-		if (ratio < 0.10) return CrewkitText.RED;
-		if (ratio < 0.30) return CrewkitText.AMBER;
-		return CrewkitText.GREEN;
+		// Red means over budget only, so a tight-but-passing cart reads amber, never red.
+		return value / budget < 0.25 ? CrewkitText.AMBER : CrewkitText.GREEN;
 	}
 
 	private void setStatus(String text, int color) {
