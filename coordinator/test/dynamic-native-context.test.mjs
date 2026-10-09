@@ -1526,7 +1526,7 @@ test('a movement loop seen only in action progress positions steers once and ask
 	const planner = new FakePlanner(registry);
 	const steers = [];
 	planner.requestNativeTurn = async request => { planner.requests.push(request); await gate; return { status: 'completed', toolCalls: 0 }; };
-	planner.steerNativeTurn = async request => { steers.push(request); return { turnId: 'thinking' }; };
+	planner.steerNativeTurn = async request => { await resolveNativeSteerInput(request); steers.push(request); return { turnId: 'thinking' }; };
 	const run = await start({ registry, planner, config: {
 		bridge: { port: 25570, secret: 's'.repeat(32) },
 		codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
