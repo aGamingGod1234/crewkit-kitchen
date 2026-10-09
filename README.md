@@ -2,7 +2,7 @@
 
 An AI chef turns a workshop attendee list into a supply order that stays inside a small budget. A human approves it on Reap's hosted page, and a Minecraft kitchen shows every step.
 
-Reap x 65labs Agentic Buildathon (Singapore) | Reap Agentic API (sandbox) | [Demo video](TODO_REAL_URL) | MIT
+Reap x 65labs Agentic Buildathon (Singapore) | Reap Agentic API (sandbox) | [Demo video](https://youtu.be/yKMYXM9FWWQ) | MIT
 
 Track: Most Worthwhile Problem.
 
@@ -36,8 +36,6 @@ When both checks pass:
 - A bill board shows budget, quoted, charged, variance, and order id. Order placed; delivery visualized. The sandbox does not ship anything.
 
 The room is the audit log. A red ticket means over budget. Dropped gate bars mean the checkout is blocked. A bag at the door means Reap reported the order placed.
-
-> TODO: organiser testimonial (quote, name, club)
 
 ## What's real: a recorded sandbox run
 
@@ -142,7 +140,7 @@ Docs: [contract](docs/crewkit/CONTRACT.md), [brief and script](docs/crewkit/brie
 
 ## Team
 
-The Greek Warriors. `TODO: member names`
+The Greek Warriors.
 
 Repository: https://github.com/aGamingGod1234/crewkit-kitchen (public, MIT)
 

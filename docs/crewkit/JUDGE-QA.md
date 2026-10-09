@@ -20,7 +20,7 @@ It is the shared visual interface, not the point. A chat log needs reading. A ro
 
 ## Do you have user feedback?
 
-TODO: organiser testimonial (quote, name, club).
+Not yet. We built and tested the workflow at the event; talking to organisers is the next step.
 
 ## Did it work against the real Reap sandbox?
 

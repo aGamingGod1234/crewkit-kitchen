@@ -1,6 +1,6 @@
 # CrewKit Kitchen: submission text
 
-Paste each section into the submission form. Items marked `TODO` need a final value.
+Submission text as sent.
 
 ## Title
 
@@ -23,8 +23,6 @@ Built on the existing Agent Arena platform, Minecraft visualizes the purchasing 
 ## Problem
 
 The user is a student-club workshop organiser with an attendee list and a small approved budget. Turning that list into an order is tedious and error-prone: comparing products across listings, working out which items are per person and which are shared, adding shipping to the total, and forgetting items. A mistake means a second order or an over-budget one. An agent can do the legwork, but the organiser needs to check what it did without reading a chat log.
-
-> TODO: organiser testimonial (quote, name, club)
 
 ## Proof: a real sandbox run
 
@@ -88,7 +86,7 @@ Enrollment, quote, and checkout calls send an `Idempotency-Key`. The bill board 
 
 ## Links
 
-- Demo video: TODO (link)
+- Demo video: https://youtu.be/yKMYXM9FWWQ
 - Repository: https://github.com/aGamingGod1234/crewkit-kitchen (public, MIT)
 - Plan: https://mwvetbk1qiwd.postplan.dev
-- Team: The Greek Warriors. `TODO: member names`
+- Team: The Greek Warriors.
