@@ -24,6 +24,7 @@ public final class CrewkitFeatures {
 						new dev.agaminggod.arenaagents.crewkit.cast.CastFeature(),
 						new dev.agaminggod.arenaagents.crewkit.fun.soldout.SoldOutFeature(),
 						new dev.agaminggod.arenaagents.crewkit.fun.guests.GuestChatterFeature(),
+						new dev.agaminggod.arenaagents.crewkit.fun.party.CelebrationFeature(),
 						new dev.agaminggod.arenaagents.crewkit.director.DirectorFeature(),
 					});
 				}
