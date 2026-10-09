@@ -145,6 +145,7 @@ public final class StablecoinSkit implements CrewkitFeature {
 			if (running) cleanupActors(server, true);
 			running = false;
 			CrewkitDisplays.killTag(server, TAG);
+			CrewkitDisplays.killTag(server, NOOK_TAG);
 			brokerId = null;
 			sign = null;
 		} catch (RuntimeException e) {
