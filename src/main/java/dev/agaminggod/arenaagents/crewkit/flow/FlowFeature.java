@@ -106,6 +106,8 @@ public final class FlowFeature implements CrewkitFeature {
 	/** Ghost copies of cart items on their destination plates: key = item + occurrence, value = live ghost. */
 	private final Map<String, Ghost> ghosts = new LinkedHashMap<>();
 	private static final double ITEM_SCALE = 0.3;
+	/** Plates with 5-6 items use a 3x2 grid, so items shrink to keep from clipping. */
+	private static final double CROWDED_SCALE = 0.2;
 	/** Lift of a laid item's centre above the surface it rests on, so its low edge clears the plate. */
 	private static final double ITEM_LIFT = 0.09;
 	private static final double TRAY_H = 0.06;
@@ -526,7 +528,7 @@ public final class FlowFeature implements CrewkitFeature {
 			for (int k = 0; k < targets.size(); k++) {
 				Placement pl = targets.get(k);
 				if (pl.tray() != null) spawnTray(server, pl, at);
-				fly(server, wave.mcItem(), floor, pl.item(), at + k);
+				fly(server, wave.mcItem(), floor, pl.item(), pl.scale(), at + k);
 				Ghost g = takeGhost(pendingGhosts, wave.mcItem(), pl.item());
 				// The ghost fades just as the solid item lands on it: ghost = in cart, solid = paid.
 				if (g != null) later(at + k + 19, () -> fadeGhost(server, g));
@@ -547,12 +549,12 @@ public final class FlowFeature implements CrewkitFeature {
 	}
 
 	/** One item arcs from the bag to its target in four interpolated hops, then sets down. */
-	private void fly(MinecraftServer server, String mcItem, Pos from, Pos to, long at) {
+	private void fly(MinecraftServer server, String mcItem, Pos from, Pos to, double scale, long at) {
 		String tag = "ck_flow_it_" + (itemSerial++);
 		double hop = 3.0 + Math.min(2.0, Math.hypot(to.x - from.x, to.z - from.z) / 10.0);
 		later(at, () -> run(server, "summon minecraft:item_display " + from.up(0.6) + " {" + tags(tag, "ck_flow_item")
 			+ ",item:{id:\"" + mcItem + "\",count:1},teleport_duration:5"
-			+ ",brightness:{sky:15,block:15},transformation:" + laid(ITEM_SCALE) + "}"));
+			+ ",brightness:{sky:15,block:15},transformation:" + laid(scale) + "}"));
 		for (int i = 1; i <= 4; i++) {
 			double s = i / 4.0;
 			double arc = 4 * hop * s * (1 - s);
@@ -563,7 +565,7 @@ public final class FlowFeature implements CrewkitFeature {
 	}
 
 	/** Where one delivered item rests; tray is the tray's surface centre for shared items, else null. */
-	private record Placement(Pos item, Pos tray, double trayW) {}
+	private record Placement(Pos item, Pos tray, double trayW, double scale) {}
 
 	/**
 	 * Final resting spot of every item, wave by wave. Delivery and ghosts both use this, so a solid item
@@ -579,7 +581,7 @@ public final class FlowFeature implements CrewkitFeature {
 		for (Wave w : waves) {
 			List<Placement> list = new ArrayList<>();
 			if (w.perPlate()) {
-				for (int s : w.seats()) list.add(new Placement(plateSlot(s, used[s]++, total[s]), null, 0));
+				for (int s : w.seats()) list.add(new Placement(plateSlot(s, used[s]++, total[s]), null, 0, total[s] > 4 ? CROWDED_SCALE : ITEM_SCALE));
 			} else {
 				double width = w.seats().size() == 2 ? 0.8 : 1.0;
 				boolean pair = !w.seats().isEmpty() && w.seats().size() <= 2;
@@ -601,7 +603,7 @@ public final class FlowFeature implements CrewkitFeature {
 				x = freeSpot(Math.max(lo, Math.min(hi, x)), lo, hi, width, taken);
 				taken.add(x);
 				Pos tray = rel(x, PLATE_Y, table[1] + TABLE_D / 2.0);
-				list.add(new Placement(tray.up(TRAY_H + ITEM_LIFT), tray, width));
+				list.add(new Placement(tray.up(TRAY_H + ITEM_LIFT), tray, width, ITEM_SCALE));
 			}
 			out.add(list);
 		}
@@ -681,15 +683,15 @@ public final class FlowFeature implements CrewkitFeature {
 	// ---------------------------------------------------------------- ghosts
 
 	/** Where each cart item will be plated, using the same layout as delivery. Shared items sit on the tray spot. */
-	private Map<String, Pos> ghostTargets() {
-		Map<String, Pos> out = new LinkedHashMap<>();
+	private Map<String, Placement> ghostTargets() {
+		Map<String, Placement> out = new LinkedHashMap<>();
 		List<Wave> waves = buildWaves(ledgerDelivery());
 		List<List<Placement>> plan = layout(waves);
 		for (int w = 0; w < waves.size(); w++) {
 			for (Placement pl : plan.get(w)) {
 				int n = 0;
 				while (out.containsKey(waves.get(w).mcItem() + "#" + n)) n++;
-				out.put(waves.get(w).mcItem() + "#" + n, pl.item());
+				out.put(waves.get(w).mcItem() + "#" + n, pl);
 			}
 		}
 		return out;
@@ -698,7 +700,7 @@ public final class FlowFeature implements CrewkitFeature {
 	/** Diff the ghost set against the cart: new ghosts grow in, moved ones glide, removed ones shrink away. */
 	private void refreshGhosts(MinecraftServer server) {
 		if (delivered || guests.isEmpty()) return;
-		Map<String, Pos> want = ghostTargets();
+		Map<String, Placement> want = ghostTargets();
 		for (Iterator<Map.Entry<String, Ghost>> it = ghosts.entrySet().iterator(); it.hasNext(); ) {
 			Map.Entry<String, Ghost> e = it.next();
 			if (!want.containsKey(e.getKey())) {
@@ -707,12 +709,14 @@ public final class FlowFeature implements CrewkitFeature {
 			}
 		}
 		int born = 0;
-		for (Map.Entry<String, Pos> e : want.entrySet()) {
-			Pos p = e.getValue();
+		for (Map.Entry<String, Placement> e : want.entrySet()) {
+			Pos p = e.getValue().item();
+			double scale = e.getValue().scale();
 			Ghost old = ghosts.get(e.getKey());
 			if (old != null) {
 				if (Math.abs(old.pos().x - p.x) + Math.abs(old.pos().y - p.y) + Math.abs(old.pos().z - p.z) > 0.01) {
 					tp(server, old.tag(), p);
+					setTransform(server, old.tag(), laid(scale), 6);
 					ghosts.put(e.getKey(), new Ghost(old.tag(), old.mcItem(), p));
 				}
 				continue;
@@ -725,7 +729,7 @@ public final class FlowFeature implements CrewkitFeature {
 				+ ",item:{id:\"" + mcItem + "\",count:1},teleport_duration:10"
 				+ ",brightness:{sky:4,block:2},transformation:" + scaleOnly(0.01) + "}");
 			final int delay = 2 + Math.min(10, born++ / 2);
-			later(delay, () -> setTransform(server, g.tag(), laid(ITEM_SCALE), 6));
+			later(delay, () -> setTransform(server, g.tag(), laid(scale), 6));
 		}
 		if (born > 0) sound(server, "block.amethyst_block.chime", rel(14.0, 3.0, 13.0), 0.35, 1.8);
 	}
@@ -805,6 +809,8 @@ public final class FlowFeature implements CrewkitFeature {
 			case 1 -> new double[][] {{0, 0}};
 			case 2 -> new double[][] {{-0.15, 0}, {0.15, 0}};
 			case 3 -> new double[][] {{-0.15, -0.13}, {0.15, -0.13}, {0, 0.13}};
+			case 4 -> new double[][] {{-0.15, -0.13}, {0.15, -0.13}, {-0.15, 0.13}, {0.15, 0.13}};
+			case 5, 6 -> new double[][] {{-0.2, -0.12}, {0, -0.12}, {0.2, -0.12}, {-0.2, 0.12}, {0, 0.12}, {0.2, 0.12}};
 			default -> new double[][] {{-0.15, -0.13}, {0.15, -0.13}, {-0.15, 0.13}, {0.15, 0.13}};
 		};
 		double[] o = slots[k % slots.length];
