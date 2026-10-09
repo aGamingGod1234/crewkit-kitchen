@@ -100,6 +100,11 @@ public final class CrewkitDispatcher {
 				LOGGER.warn("CrewKit feature {} failed to reset", feature.getClass().getSimpleName(), e);
 			}
 		}
+		try {
+			dev.agaminggod.arenaagents.crewkit.set.SetBuilder.resetDynamic(server);
+		} catch (RuntimeException e) {
+			LOGGER.warn("CrewKit set failed to reset", e);
+		}
 	}
 
 	static synchronized boolean admit(String runId, long seq) {
