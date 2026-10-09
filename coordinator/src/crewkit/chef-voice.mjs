@@ -57,7 +57,7 @@ export function createChefVoice({ speak, now = Date.now, minGapMs = CHEF_VOICE_M
         const over = Number(d.over?.amount);
         if (!(over > 0)) return;
         const n = Math.ceil(over);
-        return say('gate_blocked', `We're ${words(n)} dollar${n === 1 ? '' : 's'} over. Swapping to cheaper picks, nobody loses a seat.`);
+        return say('gate_blocked', `We're ${words(n)} dollar${n === 1 ? '' : 's'} over. My rules say no checkout. Reworking the cart.`);
       }
       case 'item_removed':
         if (d.why !== 'sold_out') return;

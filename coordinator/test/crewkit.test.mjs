@@ -391,7 +391,7 @@ test('chef voice: event-built lines at each beat, once each, 6 s apart, dropped 
   await tick(7000);
   voice({ event: 'checkout', data: {} }); await tick(7000);
   voice({ event: 'completed', data: {} }); await tick(0);
-  assert.deepEqual(lines, ['Order in! Six guests, a hundred and five dollar budget.', 'We\'re five dollars over. Swapping to cheaper picks, nobody loses a seat.',
+  assert.deepEqual(lines, ['Order in! Six guests, a hundred and five dollar budget.', 'We\'re five dollars over. My rules say no checkout. Reworking the cart.',
     'Scan to approve, I won\'t buy without you.', 'Order placed! Plating up.']);
   assert.ok(lines.every((l) => l.split(/\s+/).length <= 15));
   const busy = [];
