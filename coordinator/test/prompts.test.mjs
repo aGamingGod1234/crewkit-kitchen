@@ -30,6 +30,10 @@ test('native program reference shares the actual language, action contract and e
 	assert.match(ARENA_SCRIPT_API_REFERENCE, /bounded background(?::true)? work/);
 	assert.match(ARENA_SCRIPT_API_REFERENCE, /reuse exact noteKey if fresh prerequisites\/targets match/);
 	assert.doesNotMatch(ARENA_SCRIPT_API_REFERENCE, /Return exactly one JSON object/);
+	assert.match(ARENA_SCRIPT_API_REFERENCE, /an unqueued PROGRAM_EXHAUSTED needs another model decision/);
+	assert.doesNotMatch(ARENA_SCRIPT_API_REFERENCE, /each PROGRAM_EXHAUSTED costs/);
+	assert.match(ARENA_SCRIPT_API_REFERENCE, /count above one craft's output \(16 planks\) stacks crafts and takes the result once; CRAFT_PARTIAL says how many were made and why/);
+	assert.match(ARENA_SCRIPT_API_REFERENCE, /A break result naming a faster inventory tool means selectTool to it before the next block/);
 });
 
 test('script bindings and the installed tool reference include every shared player action', () => {

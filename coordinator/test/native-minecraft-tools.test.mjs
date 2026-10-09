@@ -354,9 +354,12 @@ test('native Minecraft tools expose the common fast path plus one validated adva
 
 test('guidance tells the model to loop bulk work, reuse facts, stop polling and end turns without text', () => {
 	const tools = Object.fromEntries(MINECRAFT_DYNAMIC_TOOLS.map((tool) => [tool.name, tool.description]));
-	assert.ok(NATIVE_AGENT_INSTRUCTIONS.length <= 1_380, 'leave headroom for later guidance requests');
-	assert.match(NATIVE_AGENT_INSTRUCTIONS, /looping background:true program \(repeatUntil a count\), not per 2-3 blocks: exhaustion costs a decision/);
-	assert.match(NATIVE_AGENT_INSTRUCTIONS, /queue a known next program right after starting it/);
+	assert.ok(NATIVE_AGENT_INSTRUCTIONS.length <= 1_500);
+	assert.match(NATIVE_AGENT_INSTRUCTIONS, /looping background:true program \(repeatUntil a count\), not per 2-3 blocks: an unqueued exhaustion needs another model decision/);
+	assert.doesNotMatch(NATIVE_AGENT_INSTRUCTIONS, /exhaustion costs a decision/, 'a queued successor skips the model round');
+	assert.match(NATIVE_AGENT_INSTRUCTIONS, /When the next program is known, queueProgram it in the same turn with a side-effect-free precondition; only natural exhaustion starts it, with no model round/);
+	assert.match(NATIVE_AGENT_INSTRUCTIONS, /Reclaim workstations/);
+	assert.match(tools.startAction, /routine changes wake you at most after 15 s and urgent ones at once; end your turn and its completion wakes you with fresh facts/);
 	assert.match(NATIVE_AGENT_INSTRUCTIONS, /reuse fresh result facts before observe\/inspect\. Never poll/);
 	assert.match(NATIVE_AGENT_INSTRUCTIONS, /End a turn by stopping, no closing text/);
 	assert.doesNotMatch(tools.startAction, /actionStatus reads it sooner/, 'contradicts the no-polling rule');

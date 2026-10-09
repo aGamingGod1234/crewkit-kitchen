@@ -105,7 +105,7 @@ test('uses one selected-model ArenaScript contract and envelope schema', () => {
 	assert.match(PLANNER_SYSTEM_PROMPT, /respawnDimensionId.*respawnX.*respawnY.*respawnZ.*respawnYaw.*respawnPitch.*respawnForced.*gameMode/s);
 	assert.match(PLANNER_SYSTEM_PROMPT, /never invent.*respawn/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /craft.*exact registered recipe id/i);
-	assert.match(PLANNER_SYSTEM_PROMPT, /craft.*count.*minimum output.*one recipe execution/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /craft.*count.*minimum output.*stacks crafts and takes the result once/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /never retry the same action signature after a deterministic failure/i);
 	assert.deepEqual([...SCRIPT_PRIMITIVES].sort(), Object.keys(ACTION_FIELDS).sort());
 	assert.doesNotMatch(PLANNER_SYSTEM_PROMPT, /default priority framework|preserve life before|prefer cooked food/i);
