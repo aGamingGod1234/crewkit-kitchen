@@ -172,8 +172,21 @@ public final class SetBuilder {
 	static void discardIfStale(Entity entity, ServerLevel level) {
 		if (!entity.entityTags().contains(SET_TAG)) return;
 		SetSavedData data = SetSavedData.get(level.getServer());
-		if (data.built && entity.entityTags().contains(generationTag(data.generation))) return;
-		level.getServer().execute(entity::discard);
+		if (!data.built || !entity.entityTags().contains(generationTag(data.generation))) {
+			level.getServer().execute(entity::discard);
+			return;
+		}
+		// resetDynamic runs at SERVER_STARTED, before saved entities load, and may respawn the anchors.
+		// When the saved copy loads later, keep exactly one marker per anchor tag.
+		String anchor = null;
+		for (Object[] row : MARKERS) if (entity.entityTags().contains((String) row[0])) anchor = (String) row[0];
+		if (anchor == null) return;
+		for (Entity other : level.getAllEntities()) {
+			if (other != entity && other.isAlive() && other.entityTags().contains(SET_TAG) && other.entityTags().contains(anchor)) {
+				level.getServer().execute(entity::discard);
+				return;
+			}
+		}
 	}
 
 	private static void spawnMarkers(ServerLevel level) {
