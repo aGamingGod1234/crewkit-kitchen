@@ -26,7 +26,7 @@ Verified on the Mini PC on 2026-10-09 with Claude Sonnet 5.5 (medium) in replay 
    `/crewkit stage` also runs `/crewkit chef ready`: it summons an agent named `Chef` (provider `claude`, model `claude-opus-5-5`, effort `low`), or reuses it if it already exists, puts it on the ck_agent anchor (8,1,6 from the origin) facing the pass, and gives it the chef skin. Wait until `/codex list` shows `Chef | Ready` (about 5 s). Run `/crewkit chef ready` on its own at any time to bring Chef back to the anchor. It is idempotent, and `/crewkit reset` keeps the agent.
 3. DM Chef the order. Its standing instructions (`coordinator/config/minecraft-agent/AGENTS.md`, "CrewKit Kitchen chef") make `crewkit_shop` its first tool call. Use this exact text (Minecraft caps a typed command at 256 characters, so keep it short):
    ```text
-   /msg Chef New order: hackathon workshop, 12 guests incl. James, John, Sandy. Budget 190 SGD. Per guest: name badge, A5 notebook, gel pen. One USB-C cable per pair. Extras: sticky notes, whiteboard markers.
+   /msg Chef New order: hackathon workshop, 6 guests: James, John, Sandy, Priya, Wei Ling, Arjun. Budget 105 SGD. Per guest: name badge, A5 notebook, gel pen. One USB-C cable per pair. Extras: sticky notes, whiteboard markers.
    ```
    Add the word `simulate` or `live` to the message to pick that mode; otherwise it runs `replay` (or `CREWKIT_AGENT_MODE`). Replay plays the recorded Popular tape, so keep the DM close to the posted ticket's items for replay. Other items need `simulate` or `live`.
 
