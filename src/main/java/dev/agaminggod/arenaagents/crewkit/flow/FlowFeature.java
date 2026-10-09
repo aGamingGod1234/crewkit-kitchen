@@ -12,6 +12,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import dev.agaminggod.arenaagents.crewkit.core.CrewkitText;
 import net.minecraft.commands.CommandSource;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.network.chat.Component;
@@ -50,7 +51,11 @@ public final class FlowFeature implements CrewkitFeature {
 
 	// Layout, in blocks relative to CrewkitAnchors.origin (x east, y up, z south). Camera looks north.
 	private static final double PASS_Z = 9.45;
-	private static final double TICKET_Y = 2.35;
+	/** Ticket bottom edge. The text grows upward; at TICKET_SCALE it tops out near y=4.8, clear of the y=7 beams and the y=3 rail (z=8). */
+	private static final double TICKET_Y = 2.3;
+	private static final double TICKET_SCALE = 0.7;
+	/** Characters per ticket line at line_width 180 (bold worst case), so nothing wraps unexpectedly. */
+	private static final int TICKET_COLS = 24;
 	private static final double RAIL_X = 4.0;
 	private static final double FIRED_X = 6.35;
 	private static final double OFFSTAGE_X = 0.4;
@@ -184,7 +189,8 @@ public final class FlowFeature implements CrewkitFeature {
 		// Ticket enters from inside the west wall and slides along the rail.
 		Pos off = rel(OFFSTAGE_X, TICKET_Y, PASS_Z);
 		run(server, "summon minecraft:text_display " + off + " {" + tags("ck_flow_ticket")
-			+ ",billboard:\"vertical\",alignment:\"left\",line_width:130,shadow:0b,teleport_duration:14"
+			+ ",billboard:\"vertical\",alignment:\"left\",line_width:180,shadow:0b,teleport_duration:14"
+			+ ",transformation:" + scaleOnly(TICKET_SCALE)
 			+ ",brightness:{sky:15,block:15},background:" + ticketBg + ",text:" + ticketText() + "}");
 		ticketSpawned = true;
 		later(2, () -> {
@@ -643,8 +649,8 @@ public final class FlowFeature implements CrewkitFeature {
 	private void onFailed(MinecraftServer server, String event, JsonObject data) {
 		qrUrl = null;
 		clearQr(server, true);
-		String reason = str(data, "reason", str(data, "status", event));
-		setTicket(server, PAPER, ("expired".equals(event) ? "EXPIRED" : "FAILED") + (reason.isEmpty() ? "" : ": " + reason), "#B91C1C");
+		String reason = str(data, "reason", str(data, "status", ""));
+		setTicket(server, PAPER, CrewkitText.failureLabel(event, str(data, "code", ""), reason), "#B91C1C");
 		tp(server, "ck_flow_ticket", rel(RAIL_X, TICKET_Y, PASS_Z));
 		sound(server, "block.beacon.deactivate", rel(QR_X + QR_TILES / 2.0, QR_Y + 1.0, PASS_Z), 0.8, 1.0);
 	}
@@ -664,8 +670,8 @@ public final class FlowFeature implements CrewkitFeature {
 		String ink = dark ? "#FFFFFF" : "#1E1E1E";
 		String soft = dark ? "#F4F4F4" : "#5A4A2A";
 		StringBuilder sb = new StringBuilder("{text:" + q("ORDER TICKET\n") + ",color:\"" + soft + "\",bold:true,extra:[");
-		sb.append("{text:").append(q(clip(title, 28) + "\n")).append(",color:\"").append(ink).append("\",bold:true}");
-		String meta = guests.size() + " guests" + (budget.isEmpty() ? "" : "  ·  budget " + budget);
+		sb.append("{text:").append(q(clip(title, TICKET_COLS) + "\n")).append(",color:\"").append(ink).append("\",bold:true}");
+		String meta = clip(guests.size() + " guests" + (budget.isEmpty() ? "" : " · " + budget), TICKET_COLS);
 		sb.append(",{text:").append(q(meta + "\n")).append(",color:\"").append(ink).append("\",bold:false}");
 		int shown = 0;
 		for (String need : needs) {
@@ -673,11 +679,11 @@ public final class FlowFeature implements CrewkitFeature {
 				sb.append(",{text:").append(q("  + " + (needs.size() - 5) + " more\n")).append(",color:\"").append(soft).append("\",bold:false}");
 				break;
 			}
-			sb.append(",{text:").append(q("• " + clip(need, 30) + "\n")).append(",color:\"").append(ink).append("\",bold:false}");
+			sb.append(",{text:").append(q("• " + clip(need, TICKET_COLS - 2) + "\n")).append(",color:\"").append(ink).append("\",bold:false}");
 			shown++;
 		}
 		if (!status.isEmpty()) {
-			sb.append(",{text:").append(q("\n" + status)).append(",color:\"").append(dark ? "#FFFFFF" : statusColor).append("\",bold:true}");
+			sb.append(",{text:").append(q("\n" + wrap(status, TICKET_COLS, 3))).append(",color:\"").append(dark ? "#FFFFFF" : statusColor).append("\",bold:true}");
 		}
 		sb.append("]}");
 		return sb.toString();
@@ -689,8 +695,9 @@ public final class FlowFeature implements CrewkitFeature {
 	}
 
 	private void pop(MinecraftServer server, String tag) {
-		setTransform(server, tag, scaleOnly(1.12), 3);
-		later(3, () -> setTransform(server, tag, scaleOnly(1.0), 4));
+		double base = "ck_flow_ticket".equals(tag) ? TICKET_SCALE : 1.0;
+		setTransform(server, tag, scaleOnly(base * 1.12), 3);
+		later(3, () -> setTransform(server, tag, scaleOnly(base), 4));
 	}
 
 	// ---------------------------------------------------------------- command helpers
@@ -779,6 +786,29 @@ public final class FlowFeature implements CrewkitFeature {
 
 	private static String clip(String s, int max) {
 		return s.length() <= max ? s : s.substring(0, max - 1) + "…";
+	}
+
+	/** Word-wrap to {@code cols} per line, at most {@code maxLines} lines; the last line is clipped. */
+	static String wrap(String s, int cols, int maxLines) {
+		List<String> lines = new ArrayList<>();
+		StringBuilder line = new StringBuilder();
+		for (String word : s.trim().split("\\s+")) {
+			while (word.length() > cols) {
+				if (line.length() > 0) { lines.add(line.toString()); line.setLength(0); }
+				lines.add(word.substring(0, cols));
+				word = word.substring(cols);
+			}
+			if (line.length() > 0 && line.length() + 1 + word.length() > cols) { lines.add(line.toString()); line.setLength(0); }
+			if (line.length() > 0) line.append(' ');
+			line.append(word);
+		}
+		if (line.length() > 0) lines.add(line.toString());
+		if (lines.size() > maxLines) {
+			List<String> kept = new ArrayList<>(lines.subList(0, maxLines));
+			kept.set(maxLines - 1, clip(kept.get(maxLines - 1) + " " + lines.get(maxLines), cols));
+			lines = kept;
+		}
+		return String.join("\n", lines);
 	}
 
 	private static String shortId(String id) {

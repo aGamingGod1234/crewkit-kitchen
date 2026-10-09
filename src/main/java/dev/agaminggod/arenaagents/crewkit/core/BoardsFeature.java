@@ -25,6 +25,7 @@ public final class BoardsFeature implements CrewkitFeature {
 	private static final float NUMBER_SCALE = 5.0f;
 	private static final int ROLL_TICKS = 24;
 	private static final int MAX_ROLL_SOUNDS = 8;
+	private static final int STATUS_MAX = 30;
 
 	private static final String[] ROW_LABELS = {"BUDGET", "QUOTED", "CHARGED", "VARIANCE", "ORDER"};
 
@@ -103,13 +104,13 @@ public final class BoardsFeature implements CrewkitFeature {
 				rollTo(value, ROLL_TICKS, now);
 				JsonObject shipping = object(data, "shipping");
 				setStatus("QUOTED " + CrewkitText.money(amount(object(data, "total")), currency)
-						+ (shipping != null ? "  (SHIP " + CrewkitText.money(amount(shipping), currency) + ")" : ""), CrewkitText.WHITE);
+						+ (shipping != null ? " (SHIP " + CrewkitText.money(amount(shipping), currency) + ")" : ""), CrewkitText.WHITE);
 			}
 			case "gate_blocked" -> {
 				ensureBudgetBoard(server);
 				double over = Math.abs(amount(object(data, "over")));
 				rollTo(-over, ROLL_TICKS + 6, now);
-				setStatus("OVER BY " + CrewkitText.money(over, currency) + " - CHECKOUT BLOCKED", CrewkitText.RED);
+				setStatus("OVER BY " + CrewkitText.money(over, currency) + " - BLOCKED", CrewkitText.RED);
 				track.merge("{block_state:{Name:\"minecraft:red_concrete\"}}");
 				pulse(number, NUMBER_SCALE, 1.15f);
 			}
@@ -134,7 +135,9 @@ public final class BoardsFeature implements CrewkitFeature {
 			case "failed", "expired" -> {
 				ensureBudgetBoard(server);
 				String reason = string(data, "reason");
-				setStatus(event.toUpperCase(Locale.ROOT) + (reason != null ? " - " + clip(reason, 34) : ""), CrewkitText.RED);
+				// The board gets a short label; the full reason only goes to the log.
+				CrewkitDispatcher.LOGGER.warn("CrewKit run {}: {}", event, reason);
+				setStatus(CrewkitText.failureLabel(event, string(data, "code"), reason), CrewkitText.RED);
 				stopTimer(now, CrewkitText.RED);
 			}
 			case "calls" -> {
@@ -202,8 +205,9 @@ public final class BoardsFeature implements CrewkitFeature {
 		Vec3 a = CrewkitAnchors.at(CrewkitAnchors.BUDGET);
 		double x = a.x, y = a.y, z = a.z + WALL_FRONT;
 		panel = CrewkitDisplays.block(server, new Vec3(x - 4.5, y - 2.2, z - 0.04), TAG, "minecraft:black_concrete", 9f, 4.9f, 0.02f, "");
-		header = CrewkitDisplays.text(server, new Vec3(x - 1.2, y + 1.95, z), TAG, CrewkitText.of("BUDGET LEFT", CrewkitText.MUTED, true), 1.9f, "");
-		sandbox = CrewkitDisplays.text(server, new Vec3(x + 2.9, y + 1.95, z), TAG, CrewkitText.of(" LIVE SANDBOX ", CrewkitText.WHITE, true), 1.5f,
+		// Header on the left, LIVE SANDBOX as a small tag in the top-right corner, so the two never overlap.
+		header = CrewkitDisplays.text(server, new Vec3(x - 2.0, y + 1.95, z), TAG, CrewkitText.of("BUDGET LEFT", CrewkitText.MUTED, true), 1.6f, "");
+		sandbox = CrewkitDisplays.text(server, new Vec3(x + 3.1, y + 2.2, z), TAG, CrewkitText.of(" LIVE SANDBOX ", CrewkitText.WHITE, true), 0.85f,
 				"background:" + CrewkitText.argb(255, 0xC2410C));
 		number = CrewkitDisplays.text(server, new Vec3(x, y + 0.45, z), TAG, CrewkitText.of(CrewkitText.money(0, currency), CrewkitText.GREEN, true), NUMBER_SCALE, "");
 		status = CrewkitDisplays.text(server, new Vec3(x, y - 0.1, z), TAG, CrewkitText.of("", CrewkitText.MUTED, false), 1.6f, "");
@@ -257,7 +261,8 @@ public final class BoardsFeature implements CrewkitFeature {
 	}
 
 	private void setStatus(String text, int color) {
-		if (status != null) status.text(CrewkitText.of(text, color, true));
+		// One line, inside the 9-block board at scale 1.6 (about 32 bold glyphs); clip instead of wrapping into the number.
+		if (status != null) status.text(CrewkitText.of(clip(text, STATUS_MAX), color, true));
 	}
 
 	private void stopTimer(int now, int color) {

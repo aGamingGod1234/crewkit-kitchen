@@ -27,6 +27,23 @@ public final class CrewkitText {
 		return "[\"\"," + String.join(",", parts) + "]";
 	}
 
+	/**
+	 * Short on-screen label for a failed/expired run, e.g. "RUN FAILED: ENOENT". Raw reasons can be long
+	 * paths or stack text, so only an error code (or a short reason) is shown; callers log the full reason.
+	 */
+	public static String failureLabel(String event, String code, String reason) {
+		String head = "expired".equals(event) ? "RUN EXPIRED" : "RUN FAILED";
+		String tag = code == null ? "" : code.trim();
+		String why = reason == null ? "" : reason.trim();
+		if (tag.isEmpty()) {
+			java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\b(E[A-Z]{2,}|[A-Z][A-Z0-9]*_[A-Z0-9_]+)\\b").matcher(why);
+			if (m.find()) tag = m.group(1);
+			else if (!why.isEmpty() && why.length() <= 16) tag = why;
+		}
+		if (tag.length() > 16) tag = tag.substring(0, 16);
+		return tag.isEmpty() ? head : head + ": " + tag.toUpperCase(Locale.ROOT);
+	}
+
 	public static String hex(int rgb) {
 		return String.format(Locale.ROOT, "#%06X", rgb & 0xFFFFFF);
 	}
