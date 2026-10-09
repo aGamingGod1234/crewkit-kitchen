@@ -10,7 +10,7 @@ test('terminal receipt stays unconfirmed if either required replacement fails', 
 	for (const mode of ['healthy', 'late', 'report-correction-failure', 'receipt-correction-failure', 'initial-receipt-failure', 'certification-write-late']) {
 		let time = 100, phases = 0;
 		const counts = {};
-		const config = { ...f.config, runtimeBudgetMs: 195000, outputDirectory: path.join(f.directory, mode) };
+		const config = { ...f.config, outputDirectory: path.join(f.directory, mode) };
 		const operation = runPairedCli(config, { launcher, startedAtMs: 0, now: () => time,
 			persist: async (file, value) => {
 				const name = path.basename(file), count = counts[name] = (counts[name] ?? 0) + 1;

@@ -8,7 +8,7 @@ import { PendingConversationInbox } from '../src/pending-conversation-inbox.mjs'
 import { AtomicAgentStore } from '../src/observed-memory-store.mjs';
 import { MAX_IDENTIFIER_LENGTH } from '../src/constants.mjs';
 
-import { entry, fixture, drain } from './fixtures/pending-inbox-fixture.mjs';
+import { entry, fixture, drain, DISK_BOUND } from './fixtures/pending-inbox-fixture.mjs';
 
 test('pending inbox: exact retained wake survives consumption, later input and restart', async t => {
 	const { inbox, create } = await fixture(t);
@@ -96,7 +96,7 @@ test('pending inbox: fence during reclamation cannot invent unread backlog', asy
 	}
 });
 
-test('pending inbox: later steering commit cannot consume a rejected earlier reservation', async (t) => {
+test('pending inbox: later steering commit cannot consume a rejected earlier reservation', DISK_BOUND, async (t) => {
 	const { inbox } = await fixture(t);
 	await inbox.append('one', entry(1));
 	const start = await inbox.reserve();
@@ -111,7 +111,7 @@ test('pending inbox: later steering commit cannot consume a rejected earlier res
 	await inbox.close();
 });
 
-test('pending inbox: actual serialized prefix only; scope/removal fencing and duplicate collisions', async (t) => {
+test('pending inbox: actual serialized prefix only; scope/removal fencing and duplicate collisions', DISK_BOUND, async (t) => {
 	const { inbox } = await fixture(t);
 	for (let n = 1; n <= 10; n++) await inbox.append('one', entry(n));
 	assert.equal(await inbox.append('one', entry(3)), false);
@@ -131,7 +131,7 @@ test('pending inbox: actual serialized prefix only; scope/removal fencing and du
 	await inbox.close();
 });
 
-test('pending inbox: append/index failure is not admitted, partial commit retries only uncommitted bodies', async (t) => {
+test('pending inbox: append/index failure is not admitted, partial commit retries only uncommitted bodies', DISK_BOUND, async (t) => {
 	let fail = () => false;
 	const storeFactory = options => {
 		const disk = new AtomicAgentStore(options);

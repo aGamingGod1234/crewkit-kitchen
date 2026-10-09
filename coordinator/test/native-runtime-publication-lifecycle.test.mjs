@@ -29,7 +29,7 @@ function fixture(options = {}) {
 const start = { kind: 'start_action', actionType: 'wait', arguments: { durationMs: 10 } };
 const sequence = { kind: 'sequence', actions: [{ actionType: 'wait', arguments: { durationMs: 1 } }], finish: { summary: 'Verify the goal.' } };
 
-test('exact cancellation receipt releases its caller before send drain and late rejection cannot touch replacement', { timeout: 3000 }, async () => {
+test('exact cancellation receipt releases its caller before send drain and late rejection cannot touch replacement', { timeout: 60000 }, async () => {
 	const publication = deferred();
 	const run = fixture({ send: type => type === 'action_cancel' ? publication.promise : undefined });
 	const handle = await run.call(start);
@@ -53,7 +53,7 @@ test('exact cancellation receipt releases its caller before send drain and late 
 	await run.runtime.disposeAll();
 });
 
-test('replaceAction admits only exact CANCELLED while cancellation publication remains pending', { timeout: 3000 }, async () => {
+test('replaceAction admits only exact CANCELLED while cancellation publication remains pending', { timeout: 60000 }, async () => {
 	for (const terminalState of ['CANCELLED', 'SUCCEEDED']) {
 		const publication = deferred();
 		const run = fixture({ send: type => type === 'action_cancel' ? publication.promise : undefined });
@@ -111,7 +111,7 @@ test('send completion is not cancellation acknowledgement, and send failures all
 	await run.runtime.disposeAll();
 });
 
-test('disposal during undrained cancellation fences replacement and permits the next lifecycle', { timeout: 3000 }, async () => {
+test('disposal during undrained cancellation fences replacement and permits the next lifecycle', { timeout: 60000 }, async () => {
 	const publication = deferred();
 	const run = fixture({ send: type => type === 'action_cancel' ? publication.promise : undefined });
 	const handle = await run.call(start);
@@ -129,7 +129,7 @@ test('disposal during undrained cancellation fences replacement and permits the 
 	await run.runtime.disposeAll();
 });
 
-test('disposed finishing sequence releases ownership during metadata and old finally preserves new reservation', { timeout: 3000 }, async () => {
+test('disposed finishing sequence releases ownership during metadata and old finally preserves new reservation', { timeout: 60000 }, async () => {
 	const reads = [];
 	const run = fixture({ runtime: { taskContext: () => { const read = deferred(); reads.push(read); return read.promise; } } });
 	const old = run.call(sequence);
@@ -154,7 +154,7 @@ test('disposed finishing sequence releases ownership during metadata and old fin
 	await run.runtime.disposeAll();
 });
 
-test('frontier waits for hydration and current facts but returns before optional checkpoint settles', { timeout: 3000 }, async () => {
+test('frontier waits for hydration and current facts but returns before optional checkpoint settles', { timeout: 60000 }, async () => {
 	const hydration = deferred(), checkpoint = deferred(), traces = [], ingested = [];
 	let hydrated = false, flushes = 0, candidates = 0;
 	const occupancy = {

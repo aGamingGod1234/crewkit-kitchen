@@ -2,9 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { entry, fixture, drain } from './fixtures/pending-inbox-fixture.mjs';
+import { entry, fixture, drain, DISK_BOUND } from './fixtures/pending-inbox-fixture.mjs';
 
-test('pending inbox: disk pages, exact text/revision, reload and reclamation remain bounded', async (t) => {
+test('pending inbox: disk pages, exact text/revision, reload and reclamation remain bounded', DISK_BOUND, async (t) => {
 	const { directory, inbox, create } = await fixture(t);
 	for (let n = 1; n <= 160; n++) await inbox.append('server-one', entry(n));
 	const [folder] = await readdir(directory);

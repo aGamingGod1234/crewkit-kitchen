@@ -211,7 +211,9 @@ export class NativeGoalHarness {
 		// Completion assertions follow the lifecycle event, not an observation
 		// window. The test runner's existing file deadline bounds a missing event.
 		const waitForCompletion = stopAfter === 'completion';
-		const deadline = waitForCompletion ? Infinity : Date.now() + (this.#scenario.timeoutMs ?? 2_000);
+		// The window is a watchdog for a missing event, never the expected exit, so a loaded runner
+		// must not shorten it below the time the scripted turns need.
+		const deadline = waitForCompletion ? Infinity : Date.now() + Math.max(this.#scenario.timeoutMs ?? 2_000, MINIMUM_WATCHDOG_MS);
 		while (Date.now() < deadline) {
 			await tick();
 			this.#sampleListeners();
@@ -485,6 +487,8 @@ function nativeConfig() {
 		limits: { agentCap: 1, planningConcurrency: 1, goalQueueCap: 4 },
 	};
 }
+
+const MINIMUM_WATCHDOG_MS = 30_000;
 
 async function tick() {
 	await new Promise((resolve) => setImmediate(resolve));

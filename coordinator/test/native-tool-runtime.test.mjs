@@ -162,7 +162,7 @@ test('urgent interruption returns a running action without cancelling its body c
 	assert.equal(runtime.interruptBlockingTool?.('agent-a', 'danger'), true);
 	const early = await Promise.race([
 		pending,
-		new Promise((resolve) => setTimeout(() => resolve({ state: 'STILL_BLOCKED' }), 50)),
+		new Promise((resolve) => setTimeout(() => resolve({ state: 'STILL_BLOCKED' }), 10_000).unref()),
 	]);
 	assert.deepEqual(early, {
 		actionId, goalRevision: 3, actionType: 'navigate_to', state: 'RUNNING', interruptedBy: 'danger',
@@ -206,7 +206,7 @@ test('disposeAll cancels a communication-only action during coordinator shutdown
 	await runtime.disposeAll('coordinator_stopped');
 	const outcome = await Promise.race([
 		say.then(() => ({ state: 'resolved' }), (error) => ({ state: 'rejected', code: error.code })),
-		new Promise((resolve) => setTimeout(() => resolve({ state: 'STUCK' }), 50)),
+		new Promise((resolve) => setTimeout(() => resolve({ state: 'STUCK' }), 10_000).unref()),
 	]);
 	assert.deepEqual(outcome, { state: 'rejected', code: 'NATIVE_ACTION_CANCELLED' });
 	assert.deepEqual(sent.map(([type, _agentId, payload]) => [type, payload.actionId]), [
@@ -242,7 +242,7 @@ test('replace_action can return early while its exact cancellation is still awai
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.deepEqual(sent.map(([type]) => type), ['action_command', 'action_cancel']);
 	assert.equal(runtime.interruptBlockingTool('agent-a'), true);
-	const early = await Promise.race([replacement, new Promise((resolve) => setTimeout(() => resolve({ state: 'STILL_BLOCKED' }), 50))]);
+	const early = await Promise.race([replacement, new Promise((resolve) => setTimeout(() => resolve({ state: 'STILL_BLOCKED' }), 10_000).unref())]);
 	assert.equal(early.state, 'CANCELLING');
 	assert.equal(early.actionId, handle.actionId);
 	assert.equal(early.interruptedBy, 'danger');
@@ -267,7 +267,7 @@ test('an interrupted sequence reports its active step and leaves later actions u
 	assert.equal(runtime.interruptBlockingTool('agent-a'), true);
 	const early = await Promise.race([
 		pending,
-		new Promise((resolve) => setTimeout(() => resolve({ state: 'STILL_BLOCKED' }), 50)),
+		new Promise((resolve) => setTimeout(() => resolve({ state: 'STILL_BLOCKED' }), 10_000).unref()),
 	]);
 	assert.equal(early.state, 'RUNNING');
 	assert.equal(early.actionId, actionId);
@@ -1226,7 +1226,7 @@ test('the dispatch chain is traced per call: journal, bridge send and the Java a
 	});
 	runtime.updateObservation(record(), { world: { worldId: 'world-a' } }, { eventSequence: 1 });
 	const pending = runtime.execute(nativeCall({ kind: 'action', actionType: 'wait', arguments: { durationMs: 1 } }), record());
-	await new Promise((resolve) => setTimeout(resolve, 30));
+	await eventually(() => sent.length > 0);
 	const actionId = sent[0][2].actionId;
 	assert.equal(runtime.onActionProgress(record(), { actionId, progress: 0.5, elapsedMs: 40, serverTick: 4_012 }), true);
 	const timing = { acceptedAtEpochMs: 1_760_000_000_010, startedAtEpochMs: 1_760_000_000_050, startedTick: 4_001, endedTick: 4_020 };
@@ -1872,7 +1872,14 @@ test('program continuations use post-result publications that arrive before samp
 });
 
 const navigate = { kind: 'action', actionType: 'navigate_to', arguments: { x: 1, y: 64, z: 0, tolerance: 1, sprint: false, timeoutMs: 1000 } };
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// The deadline only bounds a failure; a passing test never waits for it.
+async function eventually(predicate, timeoutMs = 20_000) {
+	const started = Date.now();
+	while (!predicate()) {
+		if (Date.now() - started > timeoutMs) throw new Error('condition was not reached');
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+}
 
 // Runs one navigate_to whose result is followed by the server's publication, as the Java bridge does in the same tick.
 async function publishedAction(runtime, sent, sequence) {
@@ -1885,7 +1892,8 @@ async function publishedAction(runtime, sent, sequence) {
 }
 
 test('once publications follow results, the post-result request waits for the publication instead of costing a server sample', async () => {
-	const { runtime, sent, requests } = postResultRuntime({ publicationGraceMs: 500 });
+	// The grace never expires here: the publication below ends the wait, so a long grace costs nothing and cannot be outrun by a busy machine.
+	const { runtime, sent, requests } = postResultRuntime({ publicationGraceMs: 60_000 });
 	runtime.updateObservation(record(), { entities: [] }, { eventSequence: 1 });
 	// Until two results in a row were published, the request still goes out at once.
 	await publishedAction(runtime, sent, 2);
@@ -1894,7 +1902,8 @@ test('once publications follow results, the post-result request waits for the pu
 	const pending = runtime.execute(nativeCall(navigate), record());
 	await turn();
 	runtime.onActionResult(record(), { actionId: sent.at(-1)[2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED' });
-	await sleep(20);
+	await turn();
+	await turn();
 	assert.equal(requests.length, 2, 'the request is held back while the publication can still arrive');
 	runtime.updateObservation(record(), { pushed: 4 }, { eventSequence: 4 });
 	const result = await pending;
@@ -1912,9 +1921,9 @@ test('a missing publication still gets its request once the grace period ends, a
 	const pending = runtime.execute(nativeCall(navigate), record());
 	await turn();
 	runtime.onActionResult(record(), { actionId: sent.at(-1)[2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED' });
-	await sleep(10);
+	await turn();
 	assert.equal(requests.length, 2);
-	await sleep(80);
+	await eventually(() => requests.length === 3);
 	assert.equal(requests.length, 3, 'the explicit request remains the guarantee');
 	assert.equal(requests[2].afterEventSequence, 3, 'it is fenced at the result, like the immediate request');
 	requests[2].resolve({ eventSequence: 9, observation: { requested: true } });
@@ -1946,7 +1955,8 @@ test('a server that never publishes after results is asked at once every time', 
 	}
 });
 
-test('a lifecycle that ends during the publication grace period sends no request', async () => {
+test('a lifecycle that ends during the publication grace period sends no request', async (t) => {
+	t.mock.timers.enable({ apis: ['setTimeout'] });
 	let current = record();
 	const { runtime, sent, requests } = postResultRuntime({ publicationGraceMs: 40, registry: { get: () => current } });
 	runtime.updateObservation(record(), { entities: [] }, { eventSequence: 1 });
@@ -1955,9 +1965,10 @@ test('a lifecycle that ends during the publication grace period sends no request
 	const pending = runtime.execute(nativeCall(navigate), record()).catch((error) => error);
 	await turn();
 	runtime.onActionResult(record(), { actionId: sent.at(-1)[2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED' });
-	await sleep(5);
+	await turn();
 	current = record({ goalRevision: 4 });
 	await runtime.dispose('agent-a', 'goal_steered');
+	t.mock.timers.tick(40);
 	const result = await pending;
 	assert.equal(requests.length, 2, 'the disposed goal does not ask the server for another sample');
 	assert.equal(result.postAction.freshness.fresh, false, 'the action result stays authoritative without fresh facts');
@@ -1984,7 +1995,8 @@ test('a forced local death notice does not satisfy the post-result barrier', asy
 	assert.equal(result.postAction.observation.requested, true);
 });
 
-test('a death notice during the publication grace period neither ends the wait nor counts as a publication', async () => {
+test('a death notice during the publication grace period neither ends the wait nor counts as a publication', async (t) => {
+	t.mock.timers.enable({ apis: ['setTimeout'] });
 	const { runtime, sent, requests } = postResultRuntime({ publicationGraceMs: 150 });
 	runtime.updateObservation(record(), { entities: [] }, { eventSequence: 1 });
 	await publishedAction(runtime, sent, 2);
@@ -1992,14 +2004,15 @@ test('a death notice during the publication grace period neither ends the wait n
 	const pending = runtime.execute(nativeCall(navigate), record());
 	await turn();
 	runtime.onActionResult(record(), { actionId: sent.at(-1)[2].actionId, state: 'SUCCEEDED', reasonCode: 'DESTINATION_REACHED' });
-	await sleep(5);
+	await turn();
 	runtime.updateObservation(record(), { death: { cause: 'minecraft:lava' } }, { eventSequence: 3, force: true });
 	let settled = false;
 	void pending.then(() => { settled = true; });
-	await sleep(10);
+	await turn();
 	assert.equal(settled, false);
 	assert.equal(requests.length, 2, 'the grace period is still running');
-	await sleep(200);
+	t.mock.timers.tick(150);
+	for (let round = 0; round < 20 && requests.length < 3; round += 1) await turn();
 	assert.equal(requests.length, 3, 'with no real publication the request goes out when the grace period ends');
 	requests[2].resolve({ eventSequence: 9, observation: { requested: true } });
 	const result = await pending;

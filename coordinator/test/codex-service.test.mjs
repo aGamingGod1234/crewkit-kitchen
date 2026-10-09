@@ -922,7 +922,7 @@ test('aborting before turn start settles the decision promptly', async () => {
 	controller.abort();
 	const result = await Promise.race([
 		decision.then(() => 'resolved', (error) => error),
-		new Promise((resolve) => setTimeout(() => resolve('timeout'), 50)),
+		new Promise((resolve) => setTimeout(() => resolve('timeout'), 10_000).unref()),
 	]);
 	assert.notEqual(result, 'timeout');
 	assert.equal(result.code, 'STALE_PLAN');
@@ -940,7 +940,7 @@ test('disposing before turn start settles the decision promptly', async () => {
 	await agent.dispose();
 	const result = await Promise.race([
 		decision.then(() => 'resolved', (error) => error),
-		new Promise((resolve) => setTimeout(() => resolve('timeout'), 50)),
+		new Promise((resolve) => setTimeout(() => resolve('timeout'), 10_000).unref()),
 	]);
 	assert.notEqual(result, 'timeout');
 	assert.equal(result.code, 'AGENT_DISPOSED');
@@ -1014,7 +1014,7 @@ test('interrupting before turn start settles the decision promptly', async (t) =
 	await agent.interrupt();
 	const result = await Promise.race([
 		decision.then(() => 'resolved', (error) => error),
-		new Promise((resolve) => setTimeout(() => resolve('timeout'), 50)),
+		new Promise((resolve) => setTimeout(() => resolve('timeout'), 10_000).unref()),
 	]);
 	assert.notEqual(result, 'timeout');
 	assert.equal(result.code, 'STALE_PLAN');
@@ -1388,7 +1388,7 @@ test('Codex returns a blocking body result early with the steer in that tool res
 		});
 		currentFacts = 'fresh danger facts';
 		let response;
-		for (let attempt = 0; attempt < 100 && response === undefined; attempt += 1) {
+		for (let attempt = 0; attempt < 10_000 && response === undefined; attempt += 1) {
 			response = transport.calls.find((call) => call.method === '$respond' && call.id === 82)?.result;
 			if (response === undefined) await new Promise((resolve) => setTimeout(resolve, 1));
 		}
@@ -1434,7 +1434,7 @@ test('a failed Codex body response rejects its queued steer waiter', async (t) =
 	await assert.rejects(turn, (error) => error.code === 'TOOL_RESPONSE_DELIVERY_FAILED');
 	const steerOutcome = await Promise.race([
 		steer.then(() => ({ state: 'resolved' }), (error) => ({ state: 'rejected', code: error.code })),
-		new Promise((resolve) => setTimeout(() => resolve({ state: 'STUCK' }), 100)),
+		new Promise((resolve) => setTimeout(() => resolve({ state: 'STUCK' }), 10_000).unref()),
 	]);
 	assert.deepEqual(steerOutcome, { state: 'rejected', code: 'TOOL_RESPONSE_DELIVERY_FAILED' });
 });

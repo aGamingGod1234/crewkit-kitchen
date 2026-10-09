@@ -78,7 +78,7 @@ test('private-only turn recording omits public hashes but public capture and pri
 for(const [name,durations,rotate,expected] of [['complete',[500,100],false,600],['rotated',[500,100],true,600],['overflow',[200,150,100,75,50],true,375],['absent',[],false,null]]) {
  test(`retained timing ${name} reports observed sums without claiming full-run coverage`,async t=>{
   const dir=await fixture(t);await writeFile(path.join(dir,'report.json'),JSON.stringify({status:'PASSED',elapsedMs:1000}));
-  const writer=new TraceWriter(path.join(dir,'coordinator.jsonl'),{preparePrivateArtifact:async()=>{},...(rotate?{maxFileBytes:1}: {})});
+  const writer=new TraceWriter(path.join(dir,'coordinator.jsonl'),{preparePrivateArtifact:async()=>{},operationTimeoutMs:30000,closeTimeoutMs:60000,...(rotate?{maxFileBytes:1}: {})});
   for(const [index,duration] of durations.entries())await writer.write('native_decision_timing',{segmentDurationMs:duration,segmentIndex:index+1,traceId:'fixture'});
   await writer.close();assert.equal(writer.statusSnapshot().incompleteCapture,false);
   const result=await summarize(dir);assert.equal(result.modelSegmentMsTotal,expected);

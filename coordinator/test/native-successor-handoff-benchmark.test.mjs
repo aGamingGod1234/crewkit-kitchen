@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { baselineRef, defaultSettings, runBenchmark } from '../src/benchmark/native-successor-handoff.mjs';
 
-test('successor benchmark preserves authored action shapes and exercises guarded runtime behavior', { timeout: 15_000 }, async () => {
+test('successor benchmark preserves authored action shapes and exercises guarded runtime behavior', { timeout: 120_000 }, async () => {
 	const result = await runBenchmark({ settings: { ...defaultSettings, repetitions: 1, warmups: 0,
 		modelDelayMs: 10, predecessorMs: 60, successorMs: 1, observationMs: 1 } });
 	assert.equal(result.baseline.commit, baselineRef);

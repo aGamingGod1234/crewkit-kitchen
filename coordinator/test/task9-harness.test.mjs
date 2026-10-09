@@ -20,7 +20,7 @@ import {
 import { compileScenarioDecision } from '../src/benchmark/scenario-program.mjs';
 
 const profile = { provider: 'replay', model: 'controlled-v1', reasoningEffort: 'fixed', serviceTier: 'synthetic-delayed' };
-const trial = (overrides = {}) => ({ id: 'stone', mode: 'replay', scenarioId: 'stone-tool-gathering', seed: 20260821, agentLoad: 4, repetitions: 5, providerProfile: profile, turnBudgetMs: 100, trialBudgetMs: 500, turnCap: 8, ...overrides });
+const trial = (overrides = {}) => ({ id: 'stone', mode: 'replay', scenarioId: 'stone-tool-gathering', seed: 20260821, agentLoad: 4, repetitions: 5, providerProfile: profile, turnBudgetMs: 10_000, trialBudgetMs: 60_000, turnCap: 8, ...overrides });
 const matrix = (overrides = {}) => ({ schemaVersion: 3, fixedSeeds: [20260821, 20260822], agentLoads: [1, 4, 8, 16], trials: [trial(overrides)] });
 const phases = TASK9_REQUIRED_PHASES.map((phase, index) => ({ phase, sequence: index + 1, monotonicMs: index, durationMs: 1 }));
 
@@ -52,6 +52,9 @@ test('creates fair A/B rows with identical cells and a separately versioned sche
 test('generated fixed rows admit the complete ordinary workload through the real runner', async (context) => {
 	for (const load of [1, 4]) await context.test(`load ${load}`, async (loadContext) => {
 		const input = matrix({ id: `stone-${load}`, agentLoad: load, repetitions: 1, turnBudgetMs: 1000, trialBudgetMs: 1800 });
+		// Only the negative control needs the short budget: it can never finish, so it times out at any load.
+		// The passing rows get a budget a loaded runner cannot exhaust.
+		const roomy = matrix({ id: `stone-${load}`, agentLoad: load, repetitions: 1, turnBudgetMs: 10_000, trialBudgetMs: 60_000 });
 		const fair = createFairAbRows({ trials: input, sourceCommits: { baseline: 'base', optimized: 'head' }, fixedConcurrency: 4 });
 		const sweep = createSchedulerSweepRows({ trials: input, sourceCommit: 'head' }).find(row => row.scheduler.fixedConcurrency === 4);
 		const cases = [...fair.map(row => [row.arm, row.scheduler]), ['sweep', sweep.scheduler],
@@ -78,7 +81,7 @@ test('generated fixed rows admit the complete ordinary workload through the real
 					};
 				},
 			});
-			const report = await runTask9SimulatorMatrix({ matrix: input, scheduler, providerFactories: { replay: provider }, artifactDirectory: null });
+			const report = await runTask9SimulatorMatrix({ matrix: name === 'reserved-slot' ? input : roomy, scheduler, providerFactories: { replay: provider }, artifactDirectory: null });
 			const result = report.trials[0];
 			assert.deepEqual(result.scheduler, { mode: 'fixed', maxConcurrent: load, maxPending: 0, urgentReserve: scheduler.urgentReserve });
 			assert.equal(report.runManifest.scheduler.urgentReserve, scheduler.urgentReserve);

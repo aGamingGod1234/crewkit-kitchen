@@ -44,7 +44,17 @@ async function burst(count,rejectSteer=false,long=true,onFixture=()=>{}) {
 }
 async function readHistory() {
   const f=await fixture();
-  try { for(let s=1;s<=60;s++){await f.bridge.deliver('conversation_event',event(s));await flush();}
+  try { for(let s=1;s<=60;s++){
+      await f.bridge.deliver('conversation_event',event(s));
+      // Settled means the delivery turn and its one reply correction have both completed; a fixed sleep
+      // let the next message arrive mid-turn on a loaded runner and redelivered the unsettled entries.
+      await f.waitForTrace(traces=>{
+        const starts=f.calls.filter(c=>c.kind==='start'),last=starts.at(-1);
+        return last?.accepted===true && last.conversation.entries.length===0
+          && f.calls.filter(c=>c.accepted).flatMap(c=>c.conversation.entries).length>=s
+          && traces.filter(t=>t.event==='native_turn_completed').length===starts.length;
+      });
+    }
     const delivered=f.calls.flatMap(c=>c.conversation.entries.map(e=>e.sequence));assert.deepEqual(delivered,Array.from({length:60},(_,i)=>i+1));
     return {name:'already-read-history-eviction',messages:60,providerCalls:f.calls.length,exactlyOnceAtSuccessfulBoundary:true};
   } finally {await f.coordinator.stop();}
