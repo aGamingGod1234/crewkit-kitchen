@@ -177,7 +177,7 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		summary: { type: 'string', minLength: 1, maxLength: 512 },
 	}, ['summary'])),
 	// CrewKit Kitchen: the server runs the purchase, enforces the budget and requirements, and holds the Reap key. The model only starts it.
-	tool('crewkit_shop', 'CrewKit Kitchen: buy an event kit through Reap for an order ticket. start begins one run (search, quote, budget gate, hosted human approval); the kitchen shows every step and payment needs a human to approve on Reap. Omit brief to use the posted order ticket. status reports the latest run. You never see payment details.', objectSchema({
+	tool('crewkit_shop', 'CrewKit: buy an event kit via Reap for an order ticket. start begins one run (search, quote, budget gate, hosted approval); the kitchen shows each step and a human approves payment on Reap. Omit brief to use the posted order ticket. status reports the last run. You never see payment details.', objectSchema({
 		action: { type: 'string', enum: ['start', 'status'] },
 		mode: { type: 'string', enum: ['replay', 'simulate', 'live'] },
 		brief: { type: 'object' },
