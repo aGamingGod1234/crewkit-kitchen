@@ -11,7 +11,7 @@ permissions:
 jobs:
   coordinator:
     name: Coordinator (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (matrix.os == 'ubuntu-latest' || matrix.os == 'ubuntu-24.04') && 'boat-large' || matrix.os }}
     strategy:
       fail-fast: false
       matrix:
